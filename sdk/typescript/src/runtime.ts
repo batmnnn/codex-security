@@ -2012,7 +2012,11 @@ export async function planOutputArchive(
   if (outputDirectory === null) return null;
   const entries = await readdir(outputDirectory).catch(nullIfMissingFileError);
   if (entries === null || entries.length === 0) return null;
-  return `${outputDirectory}.previous-${new Date()
+  return `${outputDirectory}${outputArchiveSuffix()}`;
+}
+
+function outputArchiveSuffix(): string {
+  return `.previous-${new Date()
     .toISOString()
     .replaceAll(/[-:]/g, "")
     .replace(/\.\d{3}Z$/, "")}-${randomUUID().slice(0, 8)}`;
@@ -2119,10 +2123,12 @@ async function prepareOutputDirectory(
     let created: string;
     if (process.platform === "win32") {
       const suffix = `-${randomUUID()}`;
-      // NTFS limits each filename component to 255 UTF-16 code units.
+      // Reserve room within NTFS's 255-unit component limit for later archival.
+      // The SDK suffix is longer than the workbench's .previous-<tempname> suffix.
+      const prefixLength = 255 - suffix.length - outputArchiveSuffix().length;
       created = join(
         temporaryRoot,
-        `${prefix.slice(0, 255 - suffix.length)}${suffix}`,
+        `${prefix.slice(0, prefixLength)}${suffix}`,
       );
       await createWindowsOutputDirectory(created, false);
     } else {

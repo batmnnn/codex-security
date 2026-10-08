@@ -103,6 +103,129 @@ windowsTest.each([204, 233])(
 );
 
 windowsTest(
+  "fresh SDK output keeps its private identity through workbench registration",
+  async () => {
+    const root = await temporaryDirectory();
+    await icacls(root, "/grant", "*S-1-1-0:(OI)(CI)R");
+    const repository = join(root, "repository");
+    await mkdir(repository);
+    await writeFile(join(repository, "source.txt"), "Synthetic repository");
+    const output = await runtime.prepareScanRegistrationOutput(
+      undefined,
+      "repository",
+      root,
+    );
+    const before = await lstat(output, { bigint: true });
+    const originalAcl = await descriptor(output);
+    const registered = await runtime.runWorkbench(
+      {
+        python: await runtime.resolvePluginPython(),
+        pluginRoot: PLUGIN_ROOT,
+        environment: {
+          PATH: process.env["PATH"],
+          SystemRoot: process.env["SystemRoot"],
+          CODEX_SECURITY_STATE_DIR: join(root, "state"),
+        },
+      },
+      [
+        "register-cli-scan",
+        "--repository",
+        repository,
+        "--scan-dir",
+        output,
+        "--registration-json-stdin",
+      ],
+      JSON.stringify({
+        recipe: {
+          config: {},
+          mode: "standard",
+          repository,
+          target: { kind: "repository", paths: [] },
+        },
+      }),
+    );
+    expect(registered["scanDir"]).toBe(await realpath(output));
+    const after = await lstat(output, { bigint: true });
+    expect([after.dev, after.ino]).toEqual([before.dev, before.ino]);
+    expect(originalAcl).not.toContain(";;;WD)");
+    expect(await descriptor(output)).toBe(originalAcl);
+  },
+);
+
+windowsTest.each(
+  [190, 204, 233].flatMap((length) =>
+    ["SDK", "workbench"].map((archiver) => [archiver, length] as const),
+  ),
+)(
+  "generated Windows output remains archivable through %s for a %i-character repository name",
+  async (archiver, length) => {
+    const root = await temporaryDirectory();
+    await icacls(root, "/grant", "*S-1-1-0:(OI)(CI)R");
+    const output = await runtime.prepareOutputDir(
+      undefined,
+      "r".repeat(length),
+      root,
+    );
+    await writeFile(
+      join(output, "retained.txt"),
+      "Synthetic retained scan data",
+    );
+    const original = await descriptor(output);
+    let archive: string | undefined;
+    if (archiver === "SDK") {
+      await runtime.prepareOutputDir(
+        output,
+        "fixture",
+        root,
+        undefined,
+        true,
+        (path) => {
+          archive = path;
+        },
+      );
+      expect(await descriptor(output)).not.toContain(";;;WD)");
+    } else {
+      const python = await runtime.resolvePluginPython();
+      const result = await exec(
+        python,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import argparse, json, sqlite3, sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, sys.argv[1])",
+            "from workbench_scan_start import archive_scan",
+            "connection = sqlite3.connect(':memory:')",
+            "connection.execute('CREATE TABLE scans (id TEXT, status TEXT, scan_dir TEXT)')",
+            "args = argparse.Namespace(archived_scan_dir=None, archive_existing=True)",
+            "with archive_scan(connection, args, Path(sys.argv[2]), '2026-10-08T00:00:00Z', lambda path: path.resolve()) as archive:",
+            "    print(json.dumps(str(archive)))",
+          ].join("\n"),
+          join(PLUGIN_ROOT, "scripts"),
+          output,
+        ],
+        {
+          env: {
+            PATH: process.env["PATH"],
+            SystemRoot: process.env["SystemRoot"],
+            CODEX_SECURITY_STATE_DIR: join(root, "state"),
+          },
+        },
+      );
+      archive = JSON.parse(result.stdout) as string;
+    }
+    expect(archive).toBeDefined();
+    expect(basename(archive!).length).toBeLessThanOrEqual(255);
+    expect(await readFile(join(archive!, "retained.txt"), "utf8")).toBe(
+      "Synthetic retained scan data",
+    );
+    expect(await descriptor(archive!)).toBe(original);
+  },
+);
+
+windowsTest(
   "existing Windows scan ACLs and native sandbox grants are preserved",
   async () => {
     const root = await temporaryDirectory();
