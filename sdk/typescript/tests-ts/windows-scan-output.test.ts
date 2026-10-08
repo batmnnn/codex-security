@@ -8,7 +8,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, expect, mock, test } from "bun:test";
 import { loadContract } from "../src/contract.js";
@@ -78,6 +78,27 @@ windowsTest(
       expect(acl).not.toContain(";;;WD)");
     }
     expect(await descriptor(root)).toBe(before);
+  },
+);
+
+windowsTest.each([204, 233])(
+  "generated Windows output supports a %i-character repository name",
+  async (length) => {
+    const root = await temporaryDirectory();
+    await icacls(root, "/grant", "*S-1-1-0:(OI)(CI)R");
+    const output = await runtime.prepareOutputDir(
+      undefined,
+      "r".repeat(length),
+      root,
+    );
+    expect((await lstat(output)).isDirectory()).toBe(true);
+    expect(basename(output).length).toBeLessThanOrEqual(255);
+    expect(basename(output)).toMatch(
+      /-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+    const acl = await descriptor(output);
+    expect(acl).toContain("D:P");
+    expect(acl).not.toContain(";;;WD)");
   },
 );
 

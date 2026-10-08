@@ -2115,16 +2115,19 @@ async function prepareOutputDirectory(
   );
   validateLocation?.(path ?? (await realpath(temporaryRoot)));
   if (path === null) {
-    const prefix = join(
-      temporaryRoot,
-      `codex-security-${safePrefix(repositoryName)}-`,
-    );
-    const created =
-      process.platform === "win32"
-        ? `${prefix}${randomUUID()}`
-        : await mkdtemp(prefix);
-    if (process.platform === "win32")
+    const prefix = `codex-security-${safePrefix(repositoryName)}`;
+    let created: string;
+    if (process.platform === "win32") {
+      const suffix = `-${randomUUID()}`;
+      // NTFS limits each filename component to 255 UTF-16 code units.
+      created = join(
+        temporaryRoot,
+        `${prefix.slice(0, 255 - suffix.length)}${suffix}`,
+      );
       await createWindowsOutputDirectory(created, false);
+    } else {
+      created = await mkdtemp(join(temporaryRoot, `${prefix}-`));
+    }
     if ((process.umask() & 0o700) !== 0) await chmod(created, 0o700);
     try {
       return await validatePreparedOutputDir(created, validateLocation);
