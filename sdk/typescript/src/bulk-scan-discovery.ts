@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { stdin } from "node:process";
 import { Writable } from "node:stream";
@@ -7,7 +7,7 @@ import { checkbox, confirm, input, search, Separator } from "@inquirer/prompts";
 import { Octokit } from "@octokit/core";
 import Papa from "papaparse";
 import { createAuthenticatedGitHub } from "./github.js";
-import { createPrivateOutputDirectory, expandHome } from "./runtime.js";
+import { expandHome } from "./runtime.js";
 
 const GITHUB_REPOSITORIES_QUERY = `
   query($owner: String!, $cursor: String) {
@@ -175,7 +175,7 @@ export async function runBulkScanWizard(
   }
   signal?.throwIfAborted();
 
-  await createPrivateOutputDirectory(outputDir);
+  await mkdir(outputDir, { recursive: true, mode: 0o700 });
   await writeFile(
     inputPath,
     `${Papa.unparse(

@@ -16,7 +16,6 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { hostname } from "node:os";
-import { createPrivateOutputDirectory } from "./runtime.js";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import Papa from "papaparse";
@@ -675,7 +674,7 @@ async function ensureOutputDirectory(path: string): Promise<string> {
       process.platform === "win32"
         ? await canonicalWindowsCreationPath(path)
         : path;
-    await createPrivateOutputDirectory(prepared);
+    await mkdir(prepared, { recursive: true, mode: 0o700 });
   }
   const canonical = await realpath(prepared);
   const directory = await lstat(canonical, { bigint: true });
