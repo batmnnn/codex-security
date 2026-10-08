@@ -1,5 +1,6 @@
-const MAX_WORKER_STATUS_BYTES = 64 * 1024;
-const MAX_WORKER_COUNT = 1024;
+import { isRecord } from "./record.js";
+import { isSafeNonNegativeInteger, parseJson } from "./value.js";
+
 const WORKER_STATUS_PREFIX = "CODEX_SECURITY_WORKER_STATUS ";
 const SCAN_PROGRESS_PREFIX = "CODEX_SECURITY_SCAN_PROGRESS ";
 const PREFLIGHT_COMMAND = /(?:^|[\\/])config_preflight\.py(?=$|["'\s])/u;
@@ -11,10 +12,7 @@ const WORKER_PHASES = new Set([
 ]);
 
 export type ScanWorkerPhase =
-  | "ranking"
-  | "file_review"
-  | "validation"
-  | "attack_path";
+  "ranking" | "file_review" | "validation" | "attack_path";
 
 export type ScanPhase =
   | "preflight"
@@ -30,6 +28,20 @@ export interface ScanProgress {
   filesTotal: number;
 }
 
+export function scanPhaseLabel(value: ScanWorkerPhase | ScanPhase): string {
+  return {
+    preflight: "preflight",
+    threat_model: "building threat model",
+    discovery: "reviewing files",
+    ranking: "ranking scan targets",
+    file_review: "reviewing files",
+    validation: "validating findings",
+    attack_path: "analyzing attack paths",
+    reporting: "writing report",
+  }[value];
+}
+
+/** Preflight is tool-derived; dispatch counts depend on model-emitted markers. */
 export type ScanWorkerStatus =
   | {
       kind: "preflight";
@@ -68,12 +80,10 @@ export function scanProgressUpdatesFromEvent(
       : item["type"] === "command_execution"
         ? item["aggregated_output"]
         : null;
-  if (
-    typeof output !== "string" ||
-    Buffer.byteLength(output, "utf8") > MAX_WORKER_STATUS_BYTES
-  ) {
-    return [];
-  }
+  return typeof output === "string" ? scanProgressUpdatesFromText(output) : [];
+}
+
+export function scanProgressUpdatesFromText(output: string): ScanProgress[] {
   const updates: ScanProgress[] = [];
   let codeFence = false;
   for (const line of output.split(/\r?\n/u)) {
@@ -82,32 +92,19 @@ export function scanProgressUpdatesFromEvent(
       continue;
     }
     if (codeFence || !line.startsWith(SCAN_PROGRESS_PREFIX)) continue;
-    if (
-      updates.length === MAX_WORKER_COUNT ||
-      (item["type"] === "agent_message" && updates.length > 0)
-    ) {
-      return [];
-    }
     const progress = scanProgressFromMarker(line);
-    if (progress === null) return [];
-    updates.push(progress);
+    if (progress !== null) updates.push(progress);
   }
   return updates;
 }
 
 function scanProgressFromMarker(marker: string): ScanProgress | null {
-  let payload: unknown;
-  try {
-    payload = JSON.parse(marker.slice(SCAN_PROGRESS_PREFIX.length));
-  } catch {
-    return null;
-  }
+  const payload = parseJson(() => marker.slice(SCAN_PROGRESS_PREFIX.length));
   if (
     !isRecord(payload) ||
-    Object.keys(payload).length !== 3 ||
     !isScanPhase(payload["phase"]) ||
-    !isProgressCount(payload["filesCompleted"]) ||
-    !isProgressCount(payload["filesTotal"]) ||
+    !isSafeNonNegativeInteger(payload["filesCompleted"]) ||
+    !isSafeNonNegativeInteger(payload["filesTotal"]) ||
     payload["filesCompleted"] > payload["filesTotal"]
   ) {
     return null;
@@ -125,18 +122,11 @@ function preflightStatus(
   if (
     typeof item["command"] !== "string" ||
     !PREFLIGHT_COMMAND.test(item["command"]) ||
-    typeof item["aggregated_output"] !== "string" ||
-    Buffer.byteLength(item["aggregated_output"], "utf8") >
-      MAX_WORKER_STATUS_BYTES
+    typeof item["aggregated_output"] !== "string"
   ) {
     return null;
   }
-  let payload: unknown;
-  try {
-    payload = JSON.parse(item["aggregated_output"]);
-  } catch {
-    return null;
-  }
+  const payload = parseJson(() => item["aggregated_output"] as string);
   if (
     !isRecord(payload) ||
     (payload["profile"] !== "security_scan" &&
@@ -170,9 +160,8 @@ function preflightStatus(
   if (capacity.length > 1) return null;
   const capacityResult = capacity[0];
   const configuredSlots =
-    capacity.length === 1 &&
     capacityResult !== undefined &&
-    isWorkerCount(capacityResult["actual"])
+    isSafeNonNegativeInteger(capacityResult["actual"])
       ? capacityResult["actual"]
       : null;
   return { kind: "preflight", delegation, configuredSlots };
@@ -181,30 +170,19 @@ function preflightStatus(
 function dispatchStatus(
   item: Readonly<Record<string, unknown>>,
 ): ScanWorkerStatus | null {
-  if (
-    typeof item["text"] !== "string" ||
-    Buffer.byteLength(item["text"], "utf8") > MAX_WORKER_STATUS_BYTES
-  ) {
-    return null;
-  }
+  if (typeof item["text"] !== "string") return null;
   const markers = item["text"]
     .split(/\r?\n/u)
     .filter((line) => line.startsWith(WORKER_STATUS_PREFIX));
   const marker = markers[0];
   if (markers.length !== 1 || marker === undefined) return null;
-  let payload: unknown;
-  try {
-    payload = JSON.parse(marker.slice(WORKER_STATUS_PREFIX.length));
-  } catch {
-    return null;
-  }
+  const payload = parseJson(() => marker.slice(WORKER_STATUS_PREFIX.length));
   if (
     !isRecord(payload) ||
-    Object.keys(payload).length !== 3 ||
     typeof payload["phase"] !== "string" ||
     !WORKER_PHASES.has(payload["phase"]) ||
-    !isWorkerCount(payload["planned"]) ||
-    !isWorkerCount(payload["started"]) ||
+    !isSafeNonNegativeInteger(payload["planned"]) ||
+    !isSafeNonNegativeInteger(payload["started"]) ||
     payload["started"] > payload["planned"]
   ) {
     return null;
@@ -217,19 +195,6 @@ function dispatchStatus(
   };
 }
 
-function isWorkerCount(value: unknown): value is number {
-  return (
-    typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    value >= 0 &&
-    value <= MAX_WORKER_COUNT
-  );
-}
-
-function isProgressCount(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
-
 function isScanPhase(value: unknown): value is ScanPhase {
   return (
     value === "preflight" ||
@@ -239,8 +204,4 @@ function isScanPhase(value: unknown): value is ScanPhase {
     value === "attack_path" ||
     value === "reporting"
   );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

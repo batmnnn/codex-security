@@ -1,15 +1,25 @@
+import { gitProtectionRoots } from "./targets.js";
+import { isNonEmptyString } from "./value.js";
 import { execFile as execFileCallback, spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { constants, existsSync, type Stats } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  constants,
+  createWriteStream,
+  existsSync,
+  readdirSync,
+  type BigIntStats,
+  type Stats,
+} from "node:fs";
 import {
   chmod,
+  cp,
   copyFile,
   link,
   lstat,
   mkdir,
   mkdtemp,
   open,
-  opendir,
   readFile,
   readdir,
   realpath,
@@ -17,6 +27,7 @@ import {
   rm,
   rmdir,
   stat,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -25,48 +36,116 @@ import {
   basename,
   dirname,
   extname,
-  isAbsolute,
   join,
   relative,
   resolve,
   sep,
+  win32,
 } from "node:path";
-import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { pipeline } from "node:stream/promises";
 import { crc32 } from "node:zlib";
 import { setTimeout as delay } from "node:timers/promises";
-import extractZip from "extract-zip";
+import { openPromise as openZip } from "yauzl";
 import { parse } from "smol-toml";
 import {
   CodexSecurityError,
   OutputDirectoryError,
+  OutputDirectoryNotEmptyError,
+  OutputInsideProtectedRootError,
   PluginBootstrapError,
   PluginPythonUnavailableError,
-  redactedErrorMessage,
+  type ProtectedScanPathKind,
+  SandboxUnavailableError,
+  errorMessage,
+  abortReason,
 } from "./errors.js";
 import type { JsonObject } from "./config.js";
-import { resolveTrustedExecutable } from "./trusted-executable.js";
+import { isRecord } from "./record.js";
+import {
+  isWithin,
+  resolveTrustedExecutable,
+  type InspectedExecutable,
+} from "./trusted-executable.js";
+import {
+  isWindowsUnsafePathComponent,
+  windowsUnsafePathComponent,
+} from "./windows-path.js";
 
 const execFile = promisify(execFileCallback);
 
 export const MARKETPLACE_NAME = "codex-security-sdk";
 export const PLUGIN_NAME = "codex-security";
+const MARKETPLACE_MANIFEST = `${JSON.stringify(
+  {
+    name: MARKETPLACE_NAME,
+    interface: { displayName: "Codex Security SDK" },
+    plugins: [
+      {
+        name: PLUGIN_NAME,
+        source: { source: "local", path: `./plugins/${PLUGIN_NAME}` },
+        policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
+        category: "Security",
+      },
+    ],
+  },
+  null,
+  2,
+)}\n`;
 
 const MAX_ZIP_ENTRIES = 4_096;
 const MAX_ZIP_CENTRAL_DIRECTORY = 16 * 1024 * 1024;
 const MAX_ZIP_ENTRY_SIZE = 128 * 1024 * 1024;
 const MAX_ZIP_EXPANDED_SIZE = 512 * 1024 * 1024;
-const MAX_PLUGIN_MANIFEST_SIZE = 1024 * 1024;
-const MAX_PLUGIN_COPY_ENTRIES = 4_096;
-const MAX_PLUGIN_COPY_FILE_SIZE = 128 * 1024 * 1024;
-const MAX_PLUGIN_COPY_SIZE = 512 * 1024 * 1024;
 const MODEL_UNSAFE_PATH = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
 const CREDENTIAL_LOCK_NAME = ".codex-security-scan.lock";
+const CREDENTIAL_LOCK_DATABASE = ".codex-security-scan.sqlite3";
 const CREDENTIAL_LOGOUT_MARKER = ".codex-security-logged-out";
+const CREDENTIAL_LOCK_HEARTBEAT_MILLISECONDS = 5_000;
 const CREDENTIAL_LOCK_POLL_MILLISECONDS = 25;
 const INCOMPLETE_CREDENTIAL_LOCK_MILLISECONDS = 30_000;
+const MAX_PROCESS_ID = 2_147_483_647;
 const MAX_WINDOWS_CREDENTIAL_ACL_STDERR = 64 * 1024;
+const SANDBOX_PROBE_TIMEOUT_MILLISECONDS = 10_000;
+const PLUGIN_HELPER_SECRET_ENVIRONMENT_VARIABLES = new Set([
+  "OPENAI_API_KEY",
+  "CODEX_API_KEY",
+  "OPENROUTER_API_KEY",
+  "FIREWORKS_API_KEY",
+]);
+const PREPARE_SCAN_ARTIFACT_RESTORER_PROGRAM = `
+from pathlib import Path
+from runpy import run_path
+import json
+import sys
+
+module = run_path(sys.argv[1])
+canonical_path, root_identity = module["scan_root_identity"](Path(sys.argv[2]))
+print(json.dumps({
+    "canonicalPath": str(canonical_path),
+    "dev": str(root_identity[0]),
+    "ino": str(root_identity[1]),
+}, ensure_ascii=False))
+`.trim();
+const RESTORE_SCAN_ARTIFACT_PROGRAM = `
+from pathlib import Path
+from runpy import run_path
+import sys
+
+module = run_path(sys.argv[1])
+try:
+    module["write_scan_local_bytes"](
+        Path(sys.argv[2]),
+        sys.argv[3],
+        sys.stdin.buffer.read(),
+        expected_root_identity=(int(sys.argv[4]), int(sys.argv[5])),
+    )
+except (module["ContractError"], OSError) as error:
+    raise SystemExit(str(error))
+`.trim();
+const WINDOWS_CREDENTIAL_ACL_COMPLETE_PREFIX = "CODEX_SECURITY_ACL_COMPLETE:";
+const WINDOWS_CREDENTIAL_DESCENDANTS_CHANGED_EXIT_CODE = 2;
 
 export interface PluginInstall {
   pluginRoot: string;
@@ -79,7 +158,14 @@ export interface PluginInstall {
 
 export interface CodexCommand {
   command: string;
-  prefixArgs: readonly string[];
+  args?: readonly string[];
+}
+
+interface CodexCommandResult {
+  success: boolean;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
 }
 
 export type ProcessEnvironment = Record<string, string | undefined>;
@@ -89,7 +175,8 @@ export interface PluginPythonOptions {
   environment?: ProcessEnvironment;
   homeDirectory?: string;
   managedRuntimeRoots?: readonly string[];
-  protectedRoot?: string;
+  protectedRoot?: string | readonly string[];
+  currentDirectory?: string;
   signal?: AbortSignal;
 }
 
@@ -97,26 +184,50 @@ export interface WorkbenchCommandOptions {
   python: string;
   pluginRoot: string;
   environment: ProcessEnvironment;
+  stateDirectory?: string;
+  protectedRoot?: string | readonly string[];
+  currentDirectory?: string;
   signal?: AbortSignal;
   failureMessage?: string;
+}
+
+export interface ScanArtifactRestorer {
+  restore(relativePath: string, contents: Uint8Array): Promise<void>;
+}
+
+function environmentValue(
+  environment: ProcessEnvironment,
+  requested: string,
+  preserveWhitespace = false,
+): string | undefined {
+  const exact = environment[requested];
+  const value = exact?.trim()
+    ? exact
+    : Object.entries(environment).find(
+        ([name, value]) => name.toUpperCase() === requested && value?.trim(),
+      )?.[1];
+  return preserveWhitespace ? value : value?.trim();
 }
 
 export function codexSecurityStateDirectory(
   environment: ProcessEnvironment = process.env,
 ): string {
-  const environmentValue = (requested: string): string | undefined => {
-    const exact = environment[requested]?.trim();
-    if (exact) return exact;
-    return Object.entries(environment)
-      .find(
-        ([name, value]) => name.toUpperCase() === requested && value?.trim(),
-      )?.[1]
-      ?.trim();
-  };
-  const configured = environmentValue("CODEX_SECURITY_STATE_DIR");
-  if (configured !== undefined) return resolve(expandHome(configured));
-  const codexHome = environmentValue("CODEX_HOME") ?? join(homedir(), ".codex");
-  return resolve(expandHome(codexHome), "state", "plugins", "codex-security");
+  const configured = environmentValue(environment, "CODEX_SECURITY_STATE_DIR");
+  const path =
+    configured !== undefined
+      ? resolve(expandHome(configured, environment))
+      : resolve(
+          expandHome(
+            environmentValue(environment, "CODEX_HOME", true) ??
+              join(homedir(), ".codex"),
+            environment,
+          ),
+          "state",
+          "plugins",
+          "codex-security",
+        );
+  requireModelSafeOutputDir(path);
+  return path;
 }
 
 export function codexSecurityCredentialHome(
@@ -135,11 +246,7 @@ export async function prepareCodexSecurityCredentialHome(
       await mkdir(path, { recursive: true, mode: 0o700 });
     } catch (error) {
       if (nodeErrorCode(error) === "EEXIST") {
-        const existing = await lstat(path).catch(() => null);
-        if (
-          existing !== null &&
-          (!existing.isDirectory() || existing.isSymbolicLink())
-        ) {
+        if ((await lstat(path).catch(() => null))?.isDirectory() === false) {
           throw new OutputDirectoryError(
             `Codex Security credential home is not a directory: ${path}`,
             { cause: error },
@@ -149,8 +256,8 @@ export async function prepareCodexSecurityCredentialHome(
       throw error;
     }
     if ((process.umask() & 0o700) !== 0) await chmod(path, 0o700);
-    const metadata = await lstat(path);
-    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    const metadata = await lstat(path, { bigint: true });
+    if (!metadata.isDirectory()) {
       throw new OutputDirectoryError(
         `Codex Security credential home is not a directory: ${path}`,
       );
@@ -181,20 +288,18 @@ export async function prepareCodexSecurityCredentialHome(
  */
 export async function requireSecureCredentialHome(
   path: string,
-  options: {
-    platform?: NodeJS.Platform;
-    secureWindowsHome?: (path: string) => Promise<void>;
-    metadata?: Stats;
-    expectedDevice?: number;
-    expectedInode?: number;
+  options: Parameters<typeof requirePrivateDirectory>[3] & {
+    metadata?: BigIntStats;
+    expectedDevice?: bigint;
+    expectedInode?: bigint;
     validateWindowsAcl?: boolean;
   } = {},
-): Promise<Stats> {
+): Promise<BigIntStats> {
   const platform = options.platform ?? process.platform;
   let metadata = options.metadata;
   if (metadata === undefined) {
     try {
-      metadata = await lstat(path);
+      metadata = await lstat(path, { bigint: true });
     } catch (error) {
       throw new OutputDirectoryError(
         `Unable to inspect the Codex Security credential home: ${path}`,
@@ -209,7 +314,7 @@ export async function requireSecureCredentialHome(
   }
   const canonical = await realpath(path);
   requireModelSafeOutputDir(canonical);
-  const canonicalMetadata = await lstat(canonical);
+  const canonicalMetadata = await lstat(canonical, { bigint: true });
   if (
     canonicalMetadata.dev !== metadata.dev ||
     canonicalMetadata.ino !== metadata.ino
@@ -219,7 +324,7 @@ export async function requireSecureCredentialHome(
     );
   }
   metadata = canonicalMetadata;
-  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+  if (!metadata.isDirectory()) {
     throw new OutputDirectoryError(
       `Codex Security credential home is not a directory: ${path}`,
     );
@@ -234,27 +339,50 @@ export async function requireSecureCredentialHome(
       `Codex Security credential home was replaced: ${canonical}`,
     );
   }
-  if (platform === "win32") {
-    if (options.validateWindowsAcl !== false) {
-      await requirePrivateCredentialHome(metadata, canonical, {
+  if (platform !== "win32" || options.validateWindowsAcl !== false) {
+    await requirePrivateCredentialHome(
+      { mode: Number(metadata.mode), uid: Number(metadata.uid) },
+      canonical,
+      {
         platform,
         secureWindowsHome: options.secureWindowsHome,
-      });
-    }
-    return metadata;
+      },
+    );
   }
-  await requirePrivateCredentialHome(metadata, canonical, { platform });
-  await requireSecureOutputAncestry(canonical);
+  if (platform !== "win32") {
+    await requireSecureOutputAncestry(canonical);
+  }
   return metadata;
 }
 
 export async function requirePrivateCredentialHome(
   metadata: Pick<Stats, "mode" | "uid">,
   path: string,
+  options: Parameters<typeof requirePrivateDirectory>[3] = {},
+): Promise<void> {
+  await requirePrivateDirectory(metadata, path, "credential home", options);
+}
+
+export async function requirePrivatePolicyOutputDirectory(
+  path: string,
+  options: Parameters<typeof requirePrivateDirectory>[3] = {},
+): Promise<void> {
+  await requirePrivateDirectory(
+    await lstat(path),
+    path,
+    "policy output directory",
+    options,
+  );
+}
+
+async function requirePrivateDirectory(
+  metadata: Pick<Stats, "mode" | "uid">,
+  path: string,
+  description: string,
   options: {
     platform?: NodeJS.Platform;
     secureWindowsHome?: (path: string) => Promise<void>;
-  } = {},
+  },
 ): Promise<void> {
   if ((options.platform ?? process.platform) !== "win32") {
     requirePrivateOutputDirectory(metadata, path);
@@ -266,7 +394,7 @@ export async function requirePrivateCredentialHome(
   } catch (error) {
     const detail = windowsCredentialAclFailure(error);
     throw new OutputDirectoryError(
-      `Unable to create a private Windows credential home: ${path}${detail}`,
+      `Unable to create a private Windows ${description}: ${path}${detail}`,
       { cause: error },
     );
   }
@@ -280,14 +408,12 @@ function windowsCredentialAclFailure(error: unknown): string {
   const detail =
     typeof stderr === "string" && stderr.trim() !== ""
       ? stderr
-      : error instanceof Error
-        ? error.message
-        : String(error);
-  const sanitized = redactedErrorMessage(detail)
+      : errorMessage(error);
+  const normalized = errorMessage(detail)
     .replace(/\s+/gu, " ")
     .trim()
     .slice(0, 512);
-  return sanitized === "" ? "" : `. ${sanitized}`;
+  return normalized === "" ? "" : `. ${normalized}`;
 }
 
 const WINDOWS_SYSTEM_SID = "S-1-5-18";
@@ -376,6 +502,8 @@ class RepairableWindowsCredentialOwnerError extends Error {
     super(cause.message, { cause });
   }
 }
+
+class WindowsCredentialDescendantsChangedError extends Error {}
 
 /** Inspect a Windows DACL without translating locale-specific account names. */
 export function inspectWindowsCredentialAcl(
@@ -564,58 +692,12 @@ function windowsAceAllowsAncestorReplacement(
   if (/^0x[\da-f]+$/iu.test(rights)) {
     return (BigInt(rights) & 0x100d0040n) !== 0n;
   }
-  for (let index = 0; index < rights.length; index += 2) {
-    if (
-      ["FA", "GA", "FW", "GW", "SD", "WD", "WO", "DC", "DT"].includes(
-        rights.slice(index, index + 2),
-      )
-    ) {
+  // Rights tokens stay aligned to pairs of UTF-16 code units.
+  for (const [right] of rights.matchAll(/[\s\S]{2}/g)) {
+    if (["FA", "GA", "FW", "GW", "SD", "WD", "WO", "DC", "DT"].includes(right))
       return true;
-    }
   }
   return false;
-}
-
-export async function verifyStableWindowsCredentialDescendants(
-  path: string,
-  inspectDescriptors: () => Promise<number>,
-  options: { inspectEmpty?: boolean } = {},
-): Promise<void> {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    let descendants = 0;
-    const pending = [path];
-    try {
-      while (pending.length !== 0) {
-        const current = pending.pop()!;
-        const directory = await opendir(current);
-        for await (const entry of directory) {
-          const child = join(current, entry.name);
-          const metadata = await lstat(child);
-          if (metadata.isSymbolicLink()) {
-            throw new Error(
-              "Windows credential home contains a symbolic link or junction",
-            );
-          }
-          if (!metadata.isDirectory() && !metadata.isFile()) {
-            throw new Error("Windows credential home contains an unsafe entry");
-          }
-          descendants += 1;
-          if (metadata.isDirectory()) pending.push(child);
-        }
-      }
-    } catch (error) {
-      const failure = error as NodeJS.ErrnoException;
-      if (failure.code === "ENOENT" && failure.path !== path) {
-        continue;
-      }
-      throw error;
-    }
-    if (descendants === 0 && options.inspectEmpty !== true) return;
-
-    if ((await inspectDescriptors()) === descendants) return;
-  }
-
-  throw new Error("Windows credential descendants could not be verified");
 }
 
 export async function streamWindowsCredentialAclDescriptors(
@@ -623,7 +705,7 @@ export async function streamWindowsCredentialAclDescriptors(
   args: readonly string[],
   inspectDescriptor: (descriptor: string) => Promise<void>,
   options: { environment?: NodeJS.ProcessEnv } = {},
-): Promise<number> {
+): Promise<void> {
   const child = spawn(command, [...args], {
     env: options.environment,
     stdio: ["ignore", "pipe", "pipe"],
@@ -636,10 +718,16 @@ export async function streamWindowsCredentialAclDescriptors(
     if (remaining > 0) stderr += chunk.slice(0, remaining);
   });
 
+  let descendantsChanged = false;
   const completion = new Promise<void>((resolve, reject) => {
     child.once("error", reject);
     child.once("close", (code, signal) => {
       if (code === 0) {
+        resolve();
+        return;
+      }
+      if (code === WINDOWS_CREDENTIAL_DESCENDANTS_CHANGED_EXIT_CODE) {
+        descendantsChanged = true;
         resolve();
         return;
       }
@@ -653,19 +741,24 @@ export async function streamWindowsCredentialAclDescriptors(
     });
   });
 
-  let descriptors = 0;
   try {
     await Promise.all([
       completion,
       (async () => {
-        const lines = createInterface({
-          input: child.stdout,
-          crlfDelay: Infinity,
-        });
-        for await (const descriptor of lines) {
-          if (descriptor === "") continue;
-          await inspectDescriptor(descriptor);
-          descriptors += 1;
+        // Consume chunks directly: readline can resume its queued-line
+        // iterator after EOF and throw instead of draining the last lines.
+        child.stdout.setEncoding("utf8");
+        let pending = "";
+        for await (const chunk of child.stdout) {
+          const lines = (pending + chunk).split(/[\r\n]/u);
+          pending = lines.pop()!;
+          for (const descriptor of lines) {
+            if (descriptor === "") continue;
+            await inspectDescriptor(descriptor);
+          }
+        }
+        if (pending !== "") {
+          await inspectDescriptor(pending);
         }
       })(),
     ]);
@@ -674,7 +767,12 @@ export async function streamWindowsCredentialAclDescriptors(
     throw error;
   }
 
-  return descriptors;
+  if (descendantsChanged) {
+    // Finish descriptor callbacks before allowing another snapshot attempt.
+    throw new WindowsCredentialDescendantsChangedError(
+      "Windows credential descendants changed during ACL inspection",
+    );
+  }
 }
 
 export async function inspectWindowsCredentialAclSnapshot(
@@ -697,18 +795,33 @@ export async function inspectWindowsCredentialAclSnapshot(
     if (ancestor === dirname(ancestor)) break;
   }
 
-  let home: WindowsCredentialAcl | undefined;
-  let descendantsArePrivate = true;
-  await verifyStableWindowsCredentialDescendants(
-    path,
-    async () => {
-      home = undefined;
-      descendantsArePrivate = true;
-      let inspected = 0;
-      const descriptors = await streamWindowsCredentialAclDescriptors(
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let home: WindowsCredentialAcl | undefined;
+    let descendantsArePrivate = true;
+    let inspected = 0;
+    let completed = false;
+    try {
+      await streamWindowsCredentialAclDescriptors(
         options.command,
         options.args,
         async (descriptor) => {
+          if (completed) {
+            throw new Error(
+              "Windows credential ACL inspection continued after completion",
+            );
+          }
+          if (descriptor.startsWith(WINDOWS_CREDENTIAL_ACL_COMPLETE_PREFIX)) {
+            if (
+              descriptor !==
+              `${WINDOWS_CREDENTIAL_ACL_COMPLETE_PREFIX}${inspected}`
+            ) {
+              throw new Error(
+                "Windows credential descendants could not be verified",
+              );
+            }
+            completed = true;
+            return;
+          }
           const index = inspected;
           inspected += 1;
           await options.resolveDescriptorAliases?.(descriptor);
@@ -761,38 +874,25 @@ export async function inspectWindowsCredentialAclSnapshot(
         },
         { environment: options.environment },
       );
-      if (descriptors <= ancestors) {
-        throw new Error(
-          "Windows credential-home ancestry could not be verified",
-        );
-      }
-      return descriptors - ancestors - 1;
-    },
-    { inspectEmpty: true },
-  );
-
-  if (home === undefined) {
-    throw new Error("Windows credential ACL could not be verified");
+    } catch (error) {
+      if (error instanceof WindowsCredentialDescendantsChangedError) continue;
+      throw error;
+    }
+    if (inspected <= ancestors) {
+      throw new Error("Windows credential-home ancestry could not be verified");
+    }
+    if (!completed) {
+      throw new Error("Windows credential descendants could not be verified");
+    }
+    if (home === undefined) {
+      throw new Error("Windows credential ACL could not be verified");
+    }
+    return { home, descendantsArePrivate };
   }
-  return { home, descendantsArePrivate };
+  throw new Error("Windows credential descendants could not be verified");
 }
 
 async function secureWindowsCredentialHome(path: string): Promise<void> {
-  await enforceWindowsPrivateDirectoryAcl(path, "apply");
-}
-
-async function applyWindowsScanOutputAcl(path: string): Promise<void> {
-  await enforceWindowsPrivateDirectoryAcl(path, "apply");
-}
-
-async function verifyWindowsScanOutputAcl(path: string): Promise<void> {
-  await enforceWindowsPrivateDirectoryAcl(path, "verify");
-}
-
-async function enforceWindowsPrivateDirectoryAcl(
-  path: string,
-  mode: "apply" | "verify",
-): Promise<void> {
   const systemRoot = process.env["SystemRoot"] ?? "C:\\Windows";
   const systemDirectory = join(systemRoot, "System32");
   const powershell = join(
@@ -835,13 +935,38 @@ async function enforceWindowsPrivateDirectoryAcl(
 
   // Signed built-in cmdlets remain available under ConstrainedLanguage;
   // arbitrary .NET constructors, static methods, and SID translation do not.
+  // Enumerate and count ACLs in the same process: parallel startup can create
+  // or remove private cache and lock files while this traversal is running.
   const script = [
     "$ErrorActionPreference = 'Stop'",
+    "$script:descriptorCount = 0",
+    "function Write-CredentialAcl($path) { $descriptor = Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $path | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl; if (-not $descriptor) { throw 'Windows credential ACL could not be verified' }; $script:descriptorCount += 1; $descriptor }",
+    "function Read-CredentialDescendants($path) {",
+    "  try { $entries = @(Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath $path -Force) } catch {",
+    // A child can disappear while an existing directory is being enumerated.
+    // Retry that incomplete listing before accepting a vanished descendant.
+    `    if ($_.FullyQualifiedErrorId -eq 'System.IO.FileNotFoundException,Microsoft.PowerShell.Commands.GetChildItemCommand') { exit ${WINDOWS_CREDENTIAL_DESCENDANTS_CHANGED_EXIT_CODE} }`,
+    "    if ($path -ne $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH -and $_.CategoryInfo.Category -eq 'ObjectNotFound') { return }",
+    "    throw",
+    "  }",
+    "  foreach ($entry in $entries) {",
+    "    if (($entry.Attributes -band 1024) -and ($entry.LinkType -in @('SymbolicLink', 'Junction'))) { throw 'Windows credential home contains a symbolic link or junction' }",
+    "    if ($entry.PSObject.TypeNames -notcontains 'System.IO.DirectoryInfo' -and $entry.PSObject.TypeNames -notcontains 'System.IO.FileInfo') { throw 'Windows credential home contains an unsafe entry' }",
+    "    try { Write-CredentialAcl $entry.FullName } catch {",
+    // A descendant can disappear inside Get-Acl after it was enumerated.
+    `      if ($_.FullyQualifiedErrorId -eq 'System.IO.FileNotFoundException,Microsoft.PowerShell.Commands.GetAclCommand' -or $_.FullyQualifiedErrorId -eq 'GetAcl_PathNotFound_Exception,Microsoft.PowerShell.Commands.GetAclCommand') { exit ${WINDOWS_CREDENTIAL_DESCENDANTS_CHANGED_EXIT_CODE} }`,
+    "      if ($_.FullyQualifiedErrorId -like 'GetAcl_PathNotFound,*') { continue }",
+    "      throw",
+    "    }",
+    "    if ($entry.PSIsContainer) { Read-CredentialDescendants $entry.FullName }",
+    "  }",
+    "}",
     "$path = $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH",
-    "while ($true) { $parent = Microsoft.PowerShell.Management\\Split-Path -Path $path -Parent; if (-not $parent -or $parent -eq $path) { break }; Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $parent | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl; $path = $parent }",
-    "Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
-    "Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH -Recurse -Force | Microsoft.PowerShell.Security\\Get-Acl | Microsoft.PowerShell.Utility\\Select-Object -ExpandProperty Sddl",
-  ].join("; ");
+    "while ($true) { $parent = Microsoft.PowerShell.Management\\Split-Path -Path $path -Parent; if (-not $parent -or $parent -eq $path) { break }; Write-CredentialAcl $parent; $path = $parent }",
+    "Write-CredentialAcl $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH",
+    "Read-CredentialDescendants $env:CODEX_SECURITY_CREDENTIAL_ACL_PATH",
+    `"${WINDOWS_CREDENTIAL_ACL_COMPLETE_PREFIX}$script:descriptorCount"`,
+  ].join("\n");
   const resolvePrincipalScript = [
     "$ErrorActionPreference = 'Stop'",
     "$descriptor = 'O:' + $env:CODEX_SECURITY_CREDENTIAL_PRINCIPAL + 'G:SYD:(A;;GA;;;SY)'",
@@ -907,40 +1032,6 @@ async function enforceWindowsPrivateDirectoryAcl(
     descendantsArePrivate = snapshot.descendantsArePrivate;
     return snapshot.home;
   };
-
-  if (mode === "verify") {
-    let verified: WindowsCredentialAcl;
-    try {
-      verified = await readAcl();
-    } catch (error) {
-      if (
-        error instanceof RepairableWindowsCredentialOwnerError ||
-        error instanceof RepairableWindowsCredentialAclError
-      ) {
-        throw new Error("Windows directory ACL is not private", {
-          cause: error,
-        });
-      }
-      throw error;
-    }
-    if (!verified.protected) {
-      throw new Error("Windows directory ACL still inherits access rules");
-    }
-    if (!verified.grantsCurrentUserAccess) {
-      throw new Error(
-        "Windows directory ACL does not grant the current user access",
-      );
-    }
-    if (verified.untrustedPrincipals.length !== 0) {
-      throw new Error(
-        "Windows directory ACL grants access to another identity",
-      );
-    }
-    if (!descendantsArePrivate) {
-      throw new Error("Windows directory descendants remain accessible");
-    }
-    return;
-  }
 
   const icacls = join(systemDirectory, "icacls.exe");
   const installTrustedAcl = async (target = path): Promise<void> => {
@@ -1046,14 +1137,28 @@ async function enforceWindowsPrivateDirectoryAcl(
   }
 }
 
+export async function withCredentialHomeLock<T>(
+  codexHome: string,
+  operation: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  const release = await acquireCodexSecurityCredentialHomeLock(
+    codexHome,
+    signal,
+  );
+  try {
+    return await operation();
+  } finally {
+    await release();
+  }
+}
+
 export async function acquireCodexSecurityCredentialHomeLock(
   codexHome: string,
   signal?: AbortSignal,
-  securityOptions: {
-    platform?: NodeJS.Platform;
-    secureWindowsHome?: (path: string) => Promise<void>;
-  } = {},
+  securityOptions: Parameters<typeof requirePrivateDirectory>[3] = {},
 ): Promise<() => Promise<void>> {
+  throwIfSignalAborted(signal);
   const homeMetadata = await requireSecureCredentialHome(
     codexHome,
     securityOptions,
@@ -1063,78 +1168,174 @@ export async function acquireCodexSecurityCredentialHomeLock(
   const lock = join(codexHome, CREDENTIAL_LOCK_NAME);
   const ownerPath = join(lock, "owner.json");
   const token = randomUUID();
+  const databasePath = join(codexHome, CREDENTIAL_LOCK_DATABASE);
+  const existingDatabaseMetadata = await lstat(databasePath).catch(
+    nullIfMissingFileError,
+  );
+  if (existingDatabaseMetadata !== null) {
+    requireCredentialLockDatabaseFile(existingDatabaseMetadata, databasePath);
+  }
+  const require = createRequire(import.meta.url);
+  // Both supported runtimes bundle SQLite. Keep the transaction in the process
+  // doing the protected work, so pausing it cannot expire its lock.
+  const Database = process.versions["bun"]
+    ? (require("bun:sqlite") as { Database: CredentialLockDatabaseConstructor })
+        .Database
+    : (
+        require("node:sqlite") as {
+          DatabaseSync: CredentialLockDatabaseConstructor;
+        }
+      ).DatabaseSync;
+  // Let SQLite create a missing guard so no separate descriptor can close after
+  // another connection acquires its process-owned POSIX lock. Keep the guard
+  // across releases so every contender locks the same inode.
+  const database = new Database(databasePath);
+  let databaseLocked = false;
 
-  while (true) {
-    throwIfSignalAborted(signal);
-    await requireSecureCredentialHome(codexHome, {
-      ...securityOptions,
-      expectedDevice,
-      expectedInode,
-      validateWindowsAcl: false,
-    });
-    const existingLock = await lstat(lock).catch((error: unknown) => {
-      if (nodeErrorCode(error) === "ENOENT") return null;
-      throw error;
-    });
-    if (existingLock !== null) {
-      if (await recoverStaleCredentialHomeLock(lock)) continue;
-      await delay(CREDENTIAL_LOCK_POLL_MILLISECONDS, undefined, { signal });
-      continue;
-    }
-    await requireSecureCredentialHome(codexHome, {
-      ...securityOptions,
-      expectedDevice,
-      expectedInode,
-    });
-    try {
-      await mkdir(lock, { mode: 0o700 });
-    } catch (error) {
-      if (nodeErrorCode(error) !== "EEXIST") throw error;
-      if (await recoverStaleCredentialHomeLock(lock)) continue;
-      await delay(CREDENTIAL_LOCK_POLL_MILLISECONDS, undefined, { signal });
-      continue;
-    }
-
-    try {
-      await writeFile(
-        ownerPath,
-        `${JSON.stringify({ pid: process.pid, token })}\n`,
-        { encoding: "utf8", flag: "wx", mode: 0o600 },
+  try {
+    // SQLite creates new databases with the process umask. Tighten or repair
+    // the guard synchronously before yielding so concurrent first-time callers
+    // cannot reject its transient mode. The credential home is already private,
+    // and the pre-open check above rejects linked existing files.
+    if (process.platform !== "win32") chmodSync(databasePath, 0o600);
+    const databaseMetadata = await lstat(databasePath);
+    requireCredentialLockDatabaseFile(databaseMetadata, databasePath);
+    if (
+      existingDatabaseMetadata !== null &&
+      (databaseMetadata.dev !== existingDatabaseMetadata.dev ||
+        databaseMetadata.ino !== existingDatabaseMetadata.ino)
+    ) {
+      throw new OutputDirectoryError(
+        `Codex Security credential-home lock changed while opening it: ${databasePath}`,
       );
-    } catch (error) {
-      await rm(lock, { recursive: true, force: true }).catch(() => undefined);
-      throw error;
     }
+    requirePrivateCredentialFile(databaseMetadata, databasePath);
 
-    let released = false;
-    return async () => {
-      if (released) return;
+    database.exec("PRAGMA busy_timeout = 0");
+    while (true) {
+      throwIfSignalAborted(signal);
+      await requireSecureCredentialHome(codexHome, {
+        ...securityOptions,
+        expectedDevice,
+        expectedInode,
+        validateWindowsAcl: false,
+      });
+      if (!databaseLocked) {
+        try {
+          database.exec("BEGIN EXCLUSIVE");
+        } catch (error) {
+          if (
+            !isRecord(error) ||
+            (error["errcode"] !== 5 && error["code"] !== "SQLITE_BUSY")
+          ) {
+            throw error;
+          }
+          await delay(CREDENTIAL_LOCK_POLL_MILLISECONDS, undefined, { signal });
+          continue;
+        }
+        const currentDatabase = await lstat(databasePath);
+        if (
+          currentDatabase.dev !== databaseMetadata.dev ||
+          currentDatabase.ino !== databaseMetadata.ino
+        ) {
+          throw new OutputDirectoryError(
+            `Codex Security credential-home lock changed while acquiring it: ${databasePath}`,
+          );
+        }
+        databaseLocked = true;
+      }
+      if ((await lstat(lock).catch(nullIfMissingFileError)) !== null) {
+        if (await recoverStaleCredentialHomeLock(lock)) continue;
+        await delay(CREDENTIAL_LOCK_POLL_MILLISECONDS, undefined, { signal });
+        continue;
+      }
       await requireSecureCredentialHome(codexHome, {
         ...securityOptions,
         expectedDevice,
         expectedInode,
       });
-      const owner = JSON.parse(await readFile(ownerPath, "utf8")) as {
-        token?: unknown;
-      };
-      if (owner.token !== token) {
-        throw new PluginBootstrapError(
-          "The Codex Security credential-home lock is no longer owned by this scan.",
-        );
+      try {
+        await mkdir(lock, { mode: 0o700 });
+      } catch (error) {
+        if (nodeErrorCode(error) !== "EEXIST") throw error;
+        if (await recoverStaleCredentialHomeLock(lock)) continue;
+        await delay(CREDENTIAL_LOCK_POLL_MILLISECONDS, undefined, { signal });
+        continue;
       }
-      await rm(lock, { recursive: true, force: true });
-      released = true;
-    };
+
+      try {
+        await writeFile(
+          ownerPath,
+          `${JSON.stringify({ pid: process.pid, token, protocol: "sqlite" })}\n`,
+          { encoding: "utf8", flag: "wx", mode: 0o600 },
+        );
+      } catch (error) {
+        await rm(lock, { recursive: true, force: true }).catch(() => undefined);
+        throw error;
+      }
+
+      // Released clients use the directory heartbeat instead of the SQLite lock.
+      const heartbeat = setInterval(async () => {
+        try {
+          const now = new Date();
+          await utimes(lock, now, now);
+        } catch {}
+      }, CREDENTIAL_LOCK_HEARTBEAT_MILLISECONDS);
+      heartbeat.unref();
+
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        try {
+          await requireSecureCredentialHome(codexHome, {
+            ...securityOptions,
+            expectedDevice,
+            expectedInode,
+          });
+          const owner = JSON.parse(await readFile(ownerPath, "utf8")) as {
+            token?: unknown;
+          };
+          if (owner.token !== token) {
+            throw new PluginBootstrapError(
+              "The Codex Security credential-home lock is no longer owned by this scan.",
+            );
+          }
+          await rm(lock, { recursive: true, force: true });
+        } finally {
+          clearInterval(heartbeat);
+          database.close();
+        }
+      };
+    }
+  } catch (error) {
+    database.close();
+    throw error;
   }
 }
 
+function requireCredentialLockDatabaseFile(
+  metadata: Stats,
+  path: string,
+): void {
+  if (!metadata.isFile() || metadata.nlink !== 1) {
+    throw new OutputDirectoryError(
+      `Codex Security credential-home lock must be a regular file, not a symlink or hard link: ${path}`,
+    );
+  }
+}
+
+interface CredentialLockDatabaseConstructor {
+  new (path: string): {
+    exec(sql: string): unknown;
+    close(): void;
+  };
+}
+
 async function recoverStaleCredentialHomeLock(lock: string): Promise<boolean> {
-  const metadata = await lstat(lock).catch((error: unknown) => {
-    if (nodeErrorCode(error) === "ENOENT") return null;
-    throw error;
-  });
+  const metadata = await lstat(lock).catch(nullIfMissingFileError);
   if (metadata === null) return true;
-  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+  if (!metadata.isDirectory()) {
     throw new OutputDirectoryError(
       `Codex Security credential-home lock is not a directory: ${lock}`,
     );
@@ -1147,29 +1348,33 @@ async function recoverStaleCredentialHomeLock(lock: string): Promise<boolean> {
     if (nodeErrorCode(error) !== "ENOENT" && !(error instanceof SyntaxError)) {
       throw error;
     }
+  }
+
+  // We hold the SQLite transaction, so a record from that protocol is orphaned.
+  // Older clients only record a PID: a live one must be respected at any age.
+  if (!isRecord(owner) || owner["protocol"] !== "sqlite") {
+    // Only positive signed-32-bit PIDs identify an owner. Other values can name
+    // process groups or fail argument validation, so use the stale-age check.
+    const ownerPid = isRecord(owner) ? owner["pid"] : undefined;
     if (
+      typeof ownerPid === "number" &&
+      Number.isInteger(ownerPid) &&
+      ownerPid > 0 &&
+      ownerPid <= MAX_PROCESS_ID
+    ) {
+      try {
+        process.kill(ownerPid, 0);
+        return false;
+      } catch (error) {
+        if (nodeErrorCode(error) === "EPERM") return false;
+        if (nodeErrorCode(error) !== "ESRCH") throw error;
+      }
+    } else if (
       Date.now() - metadata.mtimeMs <
       INCOMPLETE_CREDENTIAL_LOCK_MILLISECONDS
     ) {
       return false;
     }
-  }
-
-  if (isRecord(owner) && typeof owner["pid"] === "number") {
-    try {
-      process.kill(owner["pid"], 0);
-      return false;
-    } catch (error) {
-      if (nodeErrorCode(error) !== "ESRCH") {
-        if (nodeErrorCode(error) === "EPERM") return false;
-        throw error;
-      }
-    }
-  } else if (
-    Date.now() - metadata.mtimeMs <
-    INCOMPLETE_CREDENTIAL_LOCK_MILLISECONDS
-  ) {
-    return false;
   }
 
   const quarantine = `${lock}.stale-${randomUUID()}`;
@@ -1218,8 +1423,7 @@ export async function codexSecurityCredentialAllowsAmbientImport(
 ): Promise<boolean> {
   await requireSecureCredentialHome(codexHome);
   try {
-    const marker = await lstat(join(codexHome, CREDENTIAL_LOGOUT_MARKER));
-    if (!marker.isFile() || marker.isSymbolicLink()) {
+    if (!(await lstat(join(codexHome, CREDENTIAL_LOGOUT_MARKER))).isFile()) {
       throw new OutputDirectoryError(
         `Codex Security logout marker is not a regular file: ${codexHome}`,
       );
@@ -1243,7 +1447,7 @@ export async function codexSecurityHasStoredFileCredentials(
     if (nodeErrorCode(error) === "ENOENT") return false;
     throw error;
   }
-  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+  if (!metadata.isFile()) {
     throw new OutputDirectoryError(
       `Codex Security stored authentication is not a regular file: ${path}`,
     );
@@ -1318,46 +1522,276 @@ export async function preserveCodexSecurityPluginRegistration(
   };
 }
 
-export async function preparePersistentScanRoot(
-  stateDirectory: string,
-  repositoryName: string,
-): Promise<string> {
-  const root = join(stateDirectory, "scans", safePrefix(repositoryName));
-  await mkdir(root, { recursive: true, mode: 0o700 });
-  return await realpath(root);
+export function requireOutputOutsideRepository(
+  repository: string,
+  outputDirectory: string,
+  pathKind: ProtectedScanPathKind = "output",
+): void {
+  if (
+    isWithin(repository, outputDirectory) ||
+    (pathKind === "output" && isWithin(outputDirectory, repository))
+  ) {
+    throw new OutputInsideProtectedRootError(
+      outputDirectory,
+      repository,
+      pathKind,
+    );
+  }
 }
 
+export function requireOutputOutsideRepositories(
+  repositories: readonly string[],
+  outputDirectory: string,
+  pathKind: ProtectedScanPathKind = "output",
+): void {
+  for (const repository of repositories)
+    requireOutputOutsideRepository(repository, outputDirectory, pathKind);
+}
+
+export async function preparePersistentOutputRoot(
+  stateDirectory: string,
+  category: "scans" | "policies" | "validations" | "imports",
+  repositoryName: string,
+): Promise<string> {
+  requireModelSafeOutputDir(stateDirectory);
+  await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+  let root = await realpath(stateDirectory);
+  for (const directory of [category, safePrefix(repositoryName)]) {
+    root = join(root, directory);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    if (!(await lstat(root)).isDirectory()) {
+      throw new OutputDirectoryError(
+        `Persistent ${category === "scans" ? "scan" : category === "policies" ? "policy" : category === "imports" ? "import" : "validation"} output must use real directories: ${root}`,
+      );
+    }
+  }
+  return root;
+}
+
+const ARCHIVE_READY = "codex-security-archive-ready\n";
+const ARCHIVE_REGISTRATION_PROGRAM = String.raw`
+import io, json, runpy, sys
+control = sys.stdin
+payload = json.loads(control.readline())
+sys.stdin = io.TextIOWrapper(io.BytesIO(payload.encode("utf-8")), encoding="utf-8")
+sys.argv = sys.argv[1:]
+workbench = runpy.run_path(sys.argv[0])
+def before_archive():
+    sys.stdout.buffer.write(b"codex-security-archive-ready\n")
+    sys.stdout.buffer.flush()
+    if control.readline() != "\n":
+        raise SystemExit("Scan registration canceled before archival.")
+workbench["main"](before_archive=before_archive)
+`;
+
+const workbenchComparisonSupport = new Map<
+  string,
+  { stdin: boolean; related: boolean }
+>();
+
 export async function runWorkbench(
-  options: WorkbenchCommandOptions,
+  options: Omit<WorkbenchCommandOptions, "python"> & { python?: string },
   args: readonly string[],
+  input?: string,
 ): Promise<JsonObject> {
+  const script = join(options.pluginRoot, "scripts", "workbench_db.py");
+  let signal = options.signal;
+  const run = async (
+    arguments_: readonly string[],
+    input?: string,
+    archiveHandshake = false,
+  ): Promise<string> => {
+    const native = [
+      "database-info",
+      "store-findings",
+      "list-stored-findings",
+      "find-potential-duplicates",
+      "store-dedupe-groups",
+      "list-dedupe-groups",
+      "dashboard",
+    ].includes(arguments_[0] ?? "");
+    const node =
+      native && process.versions["bun"]
+        ? await resolveTrustedExecutable("node", options.environment, [
+            process.cwd(),
+            options.currentDirectory ?? process.cwd(),
+            ...(typeof options.protectedRoot === "string"
+              ? [options.protectedRoot]
+              : (options.protectedRoot ?? [])),
+          ])
+        : undefined;
+    if (node === null) {
+      throw new Error("Node.js is not available on a trusted PATH.");
+    }
+    const command = native
+      ? (node?.executable ?? process.execPath)
+      : (options.python ??= await resolvePluginPython({
+          environment: options.environment,
+          protectedRoot: options.protectedRoot,
+          currentDirectory: options.currentDirectory,
+          signal: options.signal,
+        }));
+    const stateDirectory = native
+      ? (options.stateDirectory ??
+        codexSecurityStateDirectory(options.environment))
+      : undefined;
+    const result = await runCodexCommand(
+      { command },
+      native
+        ? [join(options.pluginRoot, "mcp", "helpers.mjs"), ...arguments_]
+        : [
+            "-I",
+            "-X",
+            "utf8",
+            "-B",
+            ...(archiveHandshake ? ["-c", ARCHIVE_REGISTRATION_PROGRAM] : []),
+            script,
+            ...arguments_,
+          ],
+      pluginHelperEnvironment(node?.environment ?? options.environment),
+      // The SDK owns configuration normalization; the helper receives its resolved location.
+      native
+        ? JSON.stringify(
+            arguments_[0] === "database-info"
+              ? stateDirectory
+              : {
+                  stateDirectory,
+                  payload: input === undefined ? undefined : JSON.parse(input),
+                },
+          )
+        : input,
+      signal,
+      archiveHandshake,
+    );
+    if (!result.success) {
+      throw new Error(
+        result.stderr.trim() ||
+          result.stdout.trim() ||
+          `Workbench exited with status ${result.exitCode}.`,
+      );
+    }
+    return result.stdout;
+  };
   let stdout: string;
+  const savedScanIdentities = async (scanDir: string): Promise<string> => {
+    const result: unknown = JSON.parse(
+      await run(["list-scans", "--scan-root", scanDir]),
+    );
+    if (!isRecord(result) || !Array.isArray(result["scans"])) {
+      throw new Error(
+        "The workbench returned an invalid scan history response.",
+      );
+    }
+    return JSON.stringify(
+      result["scans"]
+        .map((scan: unknown) => {
+          if (
+            !isRecord(scan) ||
+            typeof scan["scanId"] !== "string" ||
+            typeof scan["scanDir"] !== "string"
+          ) {
+            throw new Error(
+              "The workbench returned an invalid scan history entry.",
+            );
+          }
+          return JSON.stringify([scan["scanId"], scan["scanDir"]]);
+        })
+        .sort(),
+    );
+  };
+  let legacyArchive:
+    { scanDir: string; archiveDir: string; savedScans: string } | undefined;
   try {
-    ({ stdout } = await execFile(
-      options.python,
-      [
-        "-I",
-        "-B",
-        join(options.pluginRoot, "scripts", "workbench_db.py"),
-        ...args,
-      ],
-      {
-        env: Object.fromEntries(
-          Object.entries(options.environment).filter(
-            ([name]) =>
-              name.toUpperCase() !== "OPENAI_API_KEY" &&
-              name.toUpperCase() !== "CODEX_API_KEY" &&
-              name.toUpperCase() !== "OPENROUTER_API_KEY" &&
-              name.toUpperCase() !== "FIREWORKS_API_KEY",
-          ),
-        ),
-        encoding: "utf8",
-        maxBuffer: 4 * 1024 * 1024,
-        windowsHide: true,
-        signal: options.signal,
-      },
-    ));
+    const arguments_ = [...args];
+    let archiveHandshake = false;
+    if (
+      arguments_[0] === "register-cli-scan" &&
+      arguments_.includes("--archive-existing") &&
+      !arguments_.includes("--archived-scan-dir")
+    ) {
+      const help = (await run(["register-cli-scan", "--help"])).replace(
+        /\s+/gu,
+        " ",
+      );
+      if (help.includes("Supports cancellable archival preparation.")) {
+        archiveHandshake = signal !== undefined;
+      } else if (
+        help.includes("Archive output in the registration transaction.")
+      ) {
+        // Earlier transactional helpers cannot acknowledge the safe cancellation
+        // boundary. Keep their move and database commit together.
+        signal?.throwIfAborted();
+        signal = undefined;
+      } else {
+        const scanDir = arguments_[arguments_.indexOf("--scan-dir") + 1]!;
+        const archiveDir = await planOutputArchive(scanDir);
+        if (archiveDir !== null) {
+          const savedScans = await savedScanIdentities(scanDir);
+          signal?.throwIfAborted();
+          await rename(scanDir, archiveDir);
+          legacyArchive = { scanDir, archiveDir, savedScans };
+          await mkdir(scanDir, { mode: 0o700 });
+          if ((process.umask() & 0o700) !== 0) await chmod(scanDir, 0o700);
+          arguments_.push("--archived-scan-dir", archiveDir);
+        }
+      }
+    }
+    const matchesStdinIndex = arguments_.indexOf("--matches-json-stdin");
+    if (
+      arguments_[0] === "save-scan-comparison" &&
+      matchesStdinIndex !== -1 &&
+      input !== undefined
+    ) {
+      const key = JSON.stringify([options.python, script]);
+      let support = workbenchComparisonSupport.get(key);
+      if (support === undefined) {
+        const help = await run(["save-scan-comparison", "--help"]);
+        options.signal?.throwIfAborted();
+        support = {
+          stdin: help.includes("--matches-json-stdin"),
+          related: help
+            .replace(/\s+/gu, " ")
+            .includes("Comparison payload supports related findings."),
+        };
+        workbenchComparisonSupport.set(key, support);
+      }
+      const comparison: unknown = JSON.parse(input);
+      if (isRecord(comparison) && "related" in comparison && !support.related) {
+        delete comparison["related"];
+        input = JSON.stringify(comparison);
+      }
+      if (!support.stdin) {
+        arguments_.splice(matchesStdinIndex, 1, "--matches-json", input);
+        input = undefined;
+      }
+    }
+    stdout = await run(arguments_, input, archiveHandshake);
   } catch (error) {
+    if (legacyArchive !== undefined) {
+      // Cancellation can stop legacy registration; recovery must still settle.
+      signal = undefined;
+      try {
+        // A helper can commit registration and lose its response. Restore only
+        // when saved identities prove that registration did not change them.
+        if (
+          (await savedScanIdentities(legacyArchive.scanDir)) ===
+          legacyArchive.savedScans
+        ) {
+          await rmdir(legacyArchive.scanDir).catch(
+            (error: NodeJS.ErrnoException) => {
+              if (error.code !== "ENOENT") throw error;
+            },
+          );
+          await rename(legacyArchive.archiveDir, legacyArchive.scanDir);
+        }
+      } catch (restoreError) {
+        throw new AggregateError(
+          [error, restoreError],
+          `Scan registration failed: ${processErrorDetail(error)}. Previous output remains at ${legacyArchive.archiveDir}; restoration could not be verified or completed: ${processErrorDetail(restoreError)}`,
+          { cause: error },
+        );
+      }
+    }
     if (options.signal?.aborted) throw error;
     const detail = processErrorDetail(error);
     const databaseFailure =
@@ -1369,7 +1803,8 @@ export async function runWorkbench(
     throw new CodexSecurityError(
       databaseFailure
         ? `${failure}: cannot open the workbench database at ${join(
-            codexSecurityStateDirectory(options.environment),
+            options.stateDirectory ??
+              codexSecurityStateDirectory(options.environment),
             "workbench.sqlite3",
           )}. Ensure the state directory and SQLite journal files are writable, or set CODEX_SECURITY_STATE_DIR to a writable directory outside the scanned repository.`
         : `${failure}: ${detail}`,
@@ -1390,20 +1825,16 @@ export async function runWorkbench(
       "The Codex Security workbench returned an invalid response.",
     );
   }
+  if (legacyArchive !== undefined)
+    result["archivedScanDir"] = legacyArchive.archiveDir;
   return result as JsonObject;
 }
 
 export function bundledPluginCandidates(moduleDirectory: string): string[] {
-  const packageCandidates = [
+  return [
     resolve(moduleDirectory, "_bundled_plugin"),
     resolve(moduleDirectory, "../_bundled_plugin"),
   ];
-  return basename(moduleDirectory) === "src"
-    ? [
-        resolve(moduleDirectory, "../../../plugins/codex-security"),
-        ...packageCandidates,
-      ]
-    : packageCandidates;
 }
 
 export async function bundledPluginRoot(): Promise<string> {
@@ -1425,31 +1856,24 @@ export async function validateOutputDir(
   if (outputDirectory === undefined) {
     return null;
   }
-  requireModelSafeOutputDir(outputDirectory);
   const path = resolve(expandHome(outputDirectory));
+  requireModelSafeOutputDir(path);
   try {
-    const metadata = await lstat(path).catch((error: unknown) => {
-      if (nodeErrorCode(error) === "ENOENT") return null;
-      throw error;
-    });
+    const metadata = await lstat(path).catch(nullIfMissingFileError);
     if (metadata !== null) {
-      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      if (!metadata.isDirectory()) {
         throw new OutputDirectoryError(
           `Scan output is not a directory: ${path}`,
         );
       }
       if (!archiveExisting && (await readdir(path)).length !== 0) {
-        throw new OutputDirectoryError(
-          `Scan output directory is not empty: ${path}. To keep the existing results and start a new scan, add --archive-existing.`,
-        );
+        throw new OutputDirectoryNotEmptyError(path);
       }
-      // Inspection only: never mutate ACLs/modes before location checks succeed.
-      const resolved = await bindPrivateScanOutputPath(path, metadata);
-      if (process.platform !== "win32") {
-        requirePrivateOutputDirectory(metadata, path);
-      }
-      await requireSecureOutputAncestry(resolved.path);
-      return resolved.path;
+      requirePrivateOutputDirectory(metadata, path);
+      await requireSecureOutputAncestry(path);
+      const canonical = await realpath(path);
+      requireModelSafeOutputDir(canonical);
+      return canonical;
     }
 
     let parent = dirname(path);
@@ -1484,20 +1908,114 @@ export async function validateOutputDir(
   }
 }
 
+export async function prepareScanArtifactRestorer(
+  options: WorkbenchCommandOptions,
+  scanDirectory: string,
+): Promise<ScanArtifactRestorer> {
+  let helperPath: string;
+  let canonicalPath: string;
+  let dev: string;
+  let ino: string;
+  try {
+    // Recovery uses the SDK-owned writer, even if the scan selected a custom plugin.
+    helperPath = join(
+      await bundledPluginRoot(),
+      "scripts",
+      "finalize_scan_contract.py",
+    );
+    const result = await runCodexCommand(
+      { command: options.python },
+      [
+        "-I",
+        "-X",
+        "utf8",
+        "-B",
+        "-c",
+        PREPARE_SCAN_ARTIFACT_RESTORER_PROGRAM,
+        helperPath,
+        scanDirectory,
+      ],
+      pluginHelperEnvironment(options.environment),
+      undefined,
+      options.signal,
+    );
+    if (!result.success) {
+      throw new Error(
+        result.stderr.trim() ||
+          result.stdout.trim() ||
+          `Artifact restoration setup exited with status ${result.exitCode}.`,
+      );
+    }
+    const prepared: unknown = JSON.parse(result.stdout);
+    if (
+      !isRecord(prepared) ||
+      !isNonEmptyString(prepared["canonicalPath"]) ||
+      typeof prepared["dev"] !== "string" ||
+      !/^(?:0|[1-9]\d*)$/u.test(prepared["dev"]) ||
+      typeof prepared["ino"] !== "string" ||
+      !/^(?:0|[1-9]\d*)$/u.test(prepared["ino"])
+    ) {
+      throw new Error("Artifact restoration setup returned invalid output.");
+    }
+    canonicalPath = prepared["canonicalPath"];
+    dev = prepared["dev"];
+    ino = prepared["ino"];
+  } catch (error) {
+    if (options.signal?.aborted) throw error;
+    throw new OutputDirectoryError(
+      "Could not securely prepare completed scan artifact restoration.",
+      { cause: error },
+    );
+  }
+
+  return {
+    async restore(relativePath, contents) {
+      try {
+        const result = await runCodexCommand(
+          { command: options.python },
+          [
+            "-I",
+            "-X",
+            "utf8",
+            "-B",
+            "-c",
+            RESTORE_SCAN_ARTIFACT_PROGRAM,
+            helperPath,
+            canonicalPath,
+            relativePath,
+            dev,
+            ino,
+          ],
+          pluginHelperEnvironment(options.environment),
+          contents,
+        );
+        if (!result.success) {
+          throw new Error(
+            result.stderr.trim() ||
+              result.stdout.trim() ||
+              `Artifact restoration exited with status ${result.exitCode}.`,
+          );
+        }
+      } catch (error) {
+        throw new OutputDirectoryError(
+          "Could not safely restore a completed scan artifact.",
+          { cause: error },
+        );
+      }
+    },
+  };
+}
+
 export async function planOutputArchive(
   outputDirectory: string | null,
 ): Promise<string | null> {
   if (outputDirectory === null) return null;
-  const entries = await readdir(outputDirectory).catch((error: unknown) => {
-    if (nodeErrorCode(error) === "ENOENT") return null;
-    throw error;
-  });
+  const entries = await readdir(outputDirectory).catch(nullIfMissingFileError);
   if (entries === null || entries.length === 0) return null;
-  const timestamp = new Date()
+  return `${outputDirectory}.previous-${new Date()
     .toISOString()
     .replaceAll(/[-:]/g, "")
-    .replace(/\.\d{3}Z$/, "");
-  return `${outputDirectory}.previous-${timestamp}-${randomUUID().slice(0, 8)}`;
+    .replace(/\.\d{3}Z$/, "")}-${randomUUID().slice(0, 8)}`;
 }
 
 export function requireModelSafeOutputDir(path: string): void {
@@ -1505,6 +2023,42 @@ export function requireModelSafeOutputDir(path: string): void {
     throw new OutputDirectoryError(
       "Scan output directory must not contain control or line-separator characters.",
     );
+  }
+  const ambiguous =
+    process.platform === "win32" ? windowsUnsafePathComponent(path) : undefined;
+  if (ambiguous !== undefined) {
+    throw new OutputDirectoryError(
+      `Codex Security paths must not contain Windows-ambiguous components: ${ambiguous}`,
+    );
+  }
+}
+
+export async function canonicalizeModelSafePath(
+  input: string,
+): Promise<string> {
+  const path = resolve(expandHome(input));
+  requireModelSafeOutputDir(path);
+  const canonical = await canonicalConfigPath(path);
+  requireModelSafeOutputDir(canonical);
+  return canonical;
+}
+
+export async function canonicalConfigPath(path: string): Promise<string> {
+  let existing = resolve(path);
+  const missing: string[] = [];
+  while (true) {
+    try {
+      return join(await realpath(existing), ...missing);
+    } catch (error) {
+      const parent = dirname(existing);
+      if (
+        (error as NodeJS.ErrnoException).code !== "ENOENT" ||
+        parent === existing
+      )
+        throw error;
+      missing.unshift(basename(existing));
+      existing = parent;
+    }
   }
 }
 
@@ -1516,16 +2070,61 @@ export async function prepareOutputDir(
   archiveExisting = false,
   onOutputArchived?: (archiveDir: string) => void,
 ): Promise<string> {
+  return prepareOutputDirectory(
+    outputDirectory,
+    repositoryName,
+    temporaryRoot,
+    validateLocation,
+    archiveExisting ? "archive" : "reject",
+    onOutputArchived,
+  );
+}
+
+/** Leave archival to the scan registration transaction. */
+export async function prepareScanRegistrationOutput(
+  outputDirectory: string | undefined,
+  repositoryName: string,
+  temporaryRoot: string = tmpdir(),
+  validateLocation?: (path: string) => void,
+  archiveExisting = false,
+): Promise<string> {
+  return prepareOutputDirectory(
+    outputDirectory,
+    repositoryName,
+    temporaryRoot,
+    validateLocation,
+    archiveExisting ? "preserve" : "reject",
+  );
+}
+
+async function prepareOutputDirectory(
+  outputDirectory: string | undefined,
+  repositoryName: string,
+  temporaryRoot: string,
+  validateLocation: ((path: string) => void) | undefined,
+  existingOutput: "reject" | "archive" | "preserve",
+  onOutputArchived?: (archiveDir: string) => void,
+): Promise<string> {
   if (outputDirectory === undefined) {
     requireModelSafeOutputDir(temporaryRoot);
     requireModelSafeOutputDir(await realpath(temporaryRoot));
   }
-  const path = await validateOutputDir(outputDirectory, archiveExisting);
+  const path = await validateOutputDir(
+    outputDirectory,
+    existingOutput !== "reject",
+  );
   validateLocation?.(path ?? (await realpath(temporaryRoot)));
   if (path === null) {
-    const created = await mkdtemp(
-      join(temporaryRoot, `codex-security-${safePrefix(repositoryName)}-`),
+    const prefix = join(
+      temporaryRoot,
+      `codex-security-${safePrefix(repositoryName)}-`,
     );
+    const created =
+      process.platform === "win32"
+        ? `${prefix}${randomUUID()}`
+        : await mkdtemp(prefix);
+    if (process.platform === "win32")
+      await createWindowsOutputDirectory(created, false);
     if ((process.umask() & 0o700) !== 0) await chmod(created, 0o700);
     try {
       return await validatePreparedOutputDir(created, validateLocation);
@@ -1536,11 +2135,8 @@ export async function prepareOutputDir(
   }
   let createdRoot: string | undefined;
   try {
-    let existing = await lstat(path).catch((error: unknown) => {
-      if (nodeErrorCode(error) === "ENOENT") return null;
-      throw error;
-    });
-    if (existing !== null && archiveExisting) {
+    let existing = await lstat(path).catch(nullIfMissingFileError);
+    if (existing !== null && existingOutput === "archive") {
       const archiveDir = await planOutputArchive(path);
       if (archiveDir !== null) {
         await rename(path, archiveDir);
@@ -1549,10 +2145,14 @@ export async function prepareOutputDir(
       }
     }
     if (existing === null) {
-      createdRoot = await mkdir(path, { recursive: true, mode: 0o700 });
+      createdRoot = await createPrivateOutputDirectory(path);
       if ((process.umask() & 0o700) !== 0) await chmod(path, 0o700);
     }
-    return await validatePreparedOutputDir(path, validateLocation);
+    return await validatePreparedOutputDir(
+      path,
+      validateLocation,
+      existingOutput === "preserve",
+    );
   } catch (error) {
     if (createdRoot !== undefined) {
       await removeEmptyDirectories(path, createdRoot);
@@ -1567,145 +2167,73 @@ export async function prepareOutputDir(
   }
 }
 
+/** Create missing output directories privately without changing existing ACLs. */
+export async function createPrivateOutputDirectory(
+  path: string,
+): Promise<string | undefined> {
+  return process.platform === "win32"
+    ? createWindowsOutputDirectory(path, true)
+    : mkdir(path, { recursive: true, mode: 0o700 });
+}
+
+async function createWindowsOutputDirectory(
+  path: string,
+  recursive: boolean,
+): Promise<string | undefined> {
+  const native = createRequire(import.meta.url)(
+    join(
+      await bundledPluginRoot(),
+      "mcp",
+      "native",
+      `win32-${process.arch}`,
+      "windows.node",
+    ),
+  ) as { createPrivateWindowsDirectory(path: Buffer): number };
+  const create = async (
+    target: string,
+    parents: boolean,
+  ): Promise<string | undefined> => {
+    const createOne = () =>
+      native.createPrivateWindowsDirectory(
+        Buffer.from(win32.toNamespacedPath(target), "utf16le"),
+      );
+    let error = createOne();
+    let firstCreated: string | undefined;
+    if (parents && (error === 2 || error === 3) && dirname(target) !== target) {
+      firstCreated = await create(dirname(target), true);
+      error = createOne();
+    }
+    if (error === 0) return firstCreated ?? target;
+    if (parents && error === 183 && (await stat(target)).isDirectory())
+      return firstCreated;
+    throw new OutputDirectoryError(
+      `Unable to create private Windows output directory (Windows error ${error}): ${target}`,
+    );
+  };
+  return create(path, recursive);
+}
+
 export async function validatePreparedOutputDir(
   path: string,
   validateLocation?: (path: string) => void,
-  options: {
-    platform?: NodeJS.Platform;
-    secureWindowsOutput?: (path: string) => Promise<void>;
-  } = {},
+  allowNonempty = false,
 ): Promise<string> {
   const metadata = await lstat(path);
-  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+  if (!metadata.isDirectory()) {
     throw new OutputDirectoryError(`Scan output is not a directory: ${path}`);
   }
   const canonical = await realpath(path);
   requireModelSafeOutputDir(canonical);
-  // Location checks must win before any ACL/mode mutation.
   validateLocation?.(canonical);
   const entries = await readdir(canonical);
-  if (entries.length !== 0) {
+  if (!allowNonempty && entries.length !== 0) {
     throw new OutputDirectoryError(
       `Scan output directory must be empty: ${path}`,
     );
   }
-  const secured = await hardenScanOutputDirectory(path, options);
-  return secured.path;
-}
-
-/**
- * Make a scan output directory private to the current user and return its
- * rebound canonical path. This is the only mutating privacy entrypoint:
- * POSIX ownership is checked before chmod 0700, and Windows ACLs are applied
- * once. Call after location validation succeeds.
- */
-export async function hardenScanOutputDirectory(
-  path: string,
-  options: {
-    platform?: NodeJS.Platform;
-    secureWindowsOutput?: (path: string) => Promise<void>;
-  } = {},
-): Promise<{ path: string; metadata: Stats }> {
-  let metadata = await lstat(path);
-  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-    throw new OutputDirectoryError(`Scan output is not a directory: ${path}`);
-  }
-  const platform = options.platform ?? process.platform;
-  if (platform !== "win32") {
-    const effectiveUid = process.geteuid?.();
-    if (effectiveUid !== undefined && metadata.uid !== effectiveUid) {
-      throw new OutputDirectoryError(
-        `Scan output directory must be owned by the current user: ${path}`,
-      );
-    }
-    if ((metadata.mode & 0o777) !== 0o700) {
-      await chmod(path, 0o700);
-      metadata = await lstat(path);
-    }
-    requirePrivateOutputDirectory(metadata, path);
-  } else {
-    try {
-      await (options.secureWindowsOutput ?? applyWindowsScanOutputAcl)(path);
-    } catch (error) {
-      throw new OutputDirectoryError(
-        `Unable to create a private Windows scan output directory: ${path}`,
-        { cause: error },
-      );
-    }
-  }
-  const secured = await bindPrivateScanOutputPath(path, metadata);
-  await requireSecureOutputAncestry(secured.path);
-  return secured;
-}
-
-/**
- * Require that scan output is still a private, unreplaced directory.
- * Never mutates mode or Windows ACLs — use {@link hardenScanOutputDirectory}
- * at prepare time, then this for contract load and subsequent checks.
- */
-export async function requirePrivateScanOutput(
-  metadata: Stats,
-  path: string,
-  options: {
-    platform?: NodeJS.Platform;
-    secureWindowsOutput?: (path: string) => Promise<void>;
-  } = {},
-): Promise<{ path: string; metadata: Stats }> {
-  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-    throw new OutputDirectoryError(`Scan output is not a directory: ${path}`);
-  }
-  if ((options.platform ?? process.platform) !== "win32") {
-    requirePrivateOutputDirectory(metadata, path);
-  } else {
-    try {
-      await (options.secureWindowsOutput ?? verifyWindowsScanOutputAcl)(path);
-    } catch (error) {
-      throw new OutputDirectoryError(
-        `Unable to verify the private Windows scan output directory: ${path}`,
-        { cause: error },
-      );
-    }
-  }
-  const secured = await bindPrivateScanOutputPath(path, metadata);
-  await requireSecureOutputAncestry(secured.path);
-  return secured;
-}
-
-async function bindPrivateScanOutputPath(
-  path: string,
-  expected: Pick<Stats, "dev" | "ino">,
-): Promise<{ path: string; metadata: Stats }> {
-  let after: Stats;
-  try {
-    after = await lstat(path);
-  } catch (error) {
-    throw new OutputDirectoryError(
-      `Unable to inspect scan output directory: ${path}`,
-      { cause: error },
-    );
-  }
-  if (!after.isDirectory() || after.isSymbolicLink()) {
-    throw new OutputDirectoryError(`Scan output is not a directory: ${path}`);
-  }
-  if (after.dev !== expected.dev || after.ino !== expected.ino) {
-    throw new OutputDirectoryError(
-      `Scan output directory was replaced: ${path}`,
-    );
-  }
-  const canonical = await realpath(path);
-  requireModelSafeOutputDir(canonical);
-  const canonicalMetadata = await lstat(canonical);
-  if (
-    !canonicalMetadata.isDirectory() ||
-    canonicalMetadata.isSymbolicLink() ||
-    canonicalMetadata.dev !== expected.dev ||
-    canonicalMetadata.ino !== expected.ino
-  ) {
-    throw new OutputDirectoryError(
-      `Scan output directory was replaced: ${canonical}`,
-    );
-  }
-  return { path: canonical, metadata: canonicalMetadata };
+  requirePrivateOutputDirectory(metadata, path);
+  await requireSecureOutputAncestry(canonical);
+  return canonical;
 }
 
 export function requirePrivateOutputDirectory(
@@ -1764,7 +2292,7 @@ export async function requireSecureOutputAncestry(
         { cause: error },
       );
     }
-    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    if (!metadata.isDirectory()) {
       throw new OutputDirectoryError(
         `Scan output parent must be a non-symlink directory: ${current}`,
       );
@@ -1912,17 +2440,16 @@ export async function extractPluginZip(
     let expandedSize = 0;
     const paths = new Set<string>();
     const checksums: Array<{ path: string; checksum: number }> = [];
-    await extractZip(archivePath, {
-      dir: staging,
-      defaultDirMode: 0o700,
-      defaultFileMode: 0o600,
-      onEntry(entry, archive) {
+    const zip = await openZip(archivePath, { strictFileNames: true });
+    try {
+      for await (const entry of zip.eachEntry()) {
         throwIfSignalAborted(signal);
-        if (archive.entryCount > MAX_ZIP_ENTRIES) {
+        if (zip.entryCount > MAX_ZIP_ENTRIES) {
           throw new PluginBootstrapError(
-            `Plugin ZIP contains too many entries: ${archive.entryCount}.`,
+            `Plugin ZIP contains too many entries: ${zip.entryCount}.`,
           );
         }
+        if (entry.fileName.startsWith("__MACOSX/")) continue;
         const path = safeArchivePath(entry.fileName);
         const collisionKey = path.toLowerCase();
         if (paths.has(collisionKey)) {
@@ -1953,11 +2480,25 @@ export async function extractPluginZip(
           mode === 0o040000 ||
           (entry.versionMadeBy >>> 8 === 0 &&
             entry.externalFileAttributes === 16);
-        if (!directory) {
-          checksums.push({ path, checksum: entry.crc32 >>> 0 });
-        }
-      },
-    });
+        const output = join(staging, ...path.split("/"));
+        const entryMode = (entry.externalFileAttributes >>> 16) & 0xffff;
+        const permissions = (entryMode || (directory ? 0o700 : 0o600)) & 0o777;
+        await mkdir(directory ? output : dirname(output), {
+          recursive: true,
+          ...(directory ? { mode: permissions } : {}),
+        });
+        if (directory) continue;
+        const stream = await zip.openReadStreamPromise(entry);
+        await pipeline(
+          stream,
+          createWriteStream(output, { mode: permissions, flags: "wx" }),
+          { signal },
+        );
+        checksums.push({ path, checksum: entry.crc32 >>> 0 });
+      }
+    } finally {
+      zip.close();
+    }
     for (const { path, checksum } of checksums) {
       throwIfSignalAborted(signal);
       const bytes = await readFile(join(staging, ...path.split("/")));
@@ -2087,7 +2628,7 @@ export async function resolvePluginPath(
       signal,
     );
   }
-  if (metadata?.isDirectory() && !metadata.isSymbolicLink()) {
+  if (metadata?.isDirectory()) {
     throwIfSignalAborted(signal);
     return await validatePluginRoot(path);
   }
@@ -2105,33 +2646,23 @@ export async function createMarketplace(
   const root = await realpath(pluginRoot);
   const marketplace = join(codexHome, "sdk-marketplace");
   const pluginDestination = join(marketplace, "plugins", PLUGIN_NAME);
-  const projectionContract = join(
-    root,
-    ".internal",
-    "external-promotion",
-    "external-projection-contract.json",
-  );
-  if (
-    root === (await bundledPluginRoot()) &&
-    (await isRegularFile(projectionContract))
-  ) {
-    await copyExternalPayload(root, pluginDestination);
-  } else {
-    await copyPluginTree(root, pluginDestination, signal);
+  await copyPluginTree(root, pluginDestination, signal);
+  const projection = await legacyPluginProjection(pluginDestination, signal);
+  for (const [path, file] of projection?.files ?? []) {
+    const destination = join(pluginDestination, path);
+    await mkdir(dirname(destination), { recursive: true });
+    await writeFile(destination, file.contents, { mode: file.mode, signal });
+    if (file.mode !== undefined) await chmod(destination, file.mode);
   }
+  await writeMarketplaceManifest(marketplace, signal);
+  return marketplace;
+}
+
+async function writeMarketplaceManifest(
+  marketplace: string,
+  signal?: AbortSignal,
+): Promise<void> {
   throwIfSignalAborted(signal);
-  const manifest = {
-    name: MARKETPLACE_NAME,
-    interface: { displayName: "Codex Security SDK" },
-    plugins: [
-      {
-        name: PLUGIN_NAME,
-        source: { source: "local", path: `./plugins/${PLUGIN_NAME}` },
-        policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
-        category: "Security",
-      },
-    ],
-  };
   const manifestPath = join(
     marketplace,
     ".agents",
@@ -2139,175 +2670,145 @@ export async function createMarketplace(
     "marketplace.json",
   );
   await mkdir(dirname(manifestPath), { recursive: true, mode: 0o700 });
-  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, {
-    encoding: "utf8",
-    flag: "wx",
-    mode: 0o600,
-    signal,
-  });
-  throwIfSignalAborted(signal);
-  return marketplace;
+  const temporary = `${manifestPath}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, MARKETPLACE_MANIFEST, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+      signal,
+    });
+    throwIfSignalAborted(signal);
+    try {
+      await rename(temporary, manifestPath);
+    } catch (error) {
+      // Concurrent replacement can fail on Windows after another repair wins.
+      const published = await readFile(manifestPath, "utf8").catch(() => null);
+      if (published !== MARKETPLACE_MANIFEST) throw error;
+    }
+    throwIfSignalAborted(signal);
+  } finally {
+    await rm(temporary, { force: true });
+  }
 }
 
-async function pluginProjectionFingerprint(
+type LegacyPluginProjection = {
+  root: string;
+  files: Map<string, { contents: Buffer; mode?: number }>;
+};
+
+async function legacyPluginProjection(
   root: string,
   signal?: AbortSignal,
-): Promise<string> {
-  throwIfSignalAborted(signal);
-  const canonical = await realpath(root);
-  const contractPath = join(
-    canonical,
-    ".internal",
-    "external-promotion",
-    "external-projection-contract.json",
+): Promise<LegacyPluginProjection | undefined> {
+  const path = join(root, ".mcp.json");
+  // Keep the source link checks ahead of any configuration read.
+  if (!(await lstat(path).catch(nullIfMissingFileError))?.isFile()) return;
+  const configuration: unknown = JSON.parse(
+    await readFile(path, { encoding: "utf8", signal }),
   );
-  let paths: string[];
-
+  const servers = isRecord(configuration)
+    ? configuration["mcpServers"]
+    : undefined;
+  const server = isRecord(servers) ? servers[PLUGIN_NAME] : undefined;
   if (
-    canonical === (await bundledPluginRoot()) &&
-    (await isRegularFile(contractPath))
+    !isRecord(server) ||
+    (server["command"] !== "./scripts/launch_codex_security_mcp" &&
+      server["command"] !== "./scripts/launch_codex_security_mcp.cmd" &&
+      !isLegacyNodeMcpServer(server))
   ) {
-    let contract: unknown;
-    try {
-      contract = JSON.parse(await readFile(contractPath, "utf8"));
-    } catch (error) {
-      throw new PluginBootstrapError(
-        `Invalid plugin projection contract: ${contractPath}`,
-        { cause: error },
-      );
-    }
-    const shipped = isRecord(contract) ? contract["shippedExact"] : undefined;
-    if (
-      !Array.isArray(shipped) ||
-      !shipped.every((path) => typeof path === "string")
-    ) {
-      throw new PluginBootstrapError(
-        "Plugin projection contract must contain shippedExact paths.",
-      );
-    }
-    paths = [
-      ...new Set(
-        [".codex-plugin/plugin.json", ...shipped]
-          .filter((path) => !path.startsWith("sdk/"))
-          .map((path) => safeArchivePath(path)),
-      ),
+    return;
+  }
+  const environment = server["env_vars"];
+  if (environment !== undefined && !Array.isArray(environment)) return;
+  const directNode = isLegacyNodeMcpServer(server);
+  if (
+    !Array.isArray(environment) ||
+    !environment.includes("CODEX_SECURITY_PLUGIN_ROOT")
+  ) {
+    server["env_vars"] = [
+      ...(Array.isArray(environment) ? environment : []),
+      "CODEX_SECURITY_PLUGIN_ROOT",
     ];
+  }
+  const files: LegacyPluginProjection["files"] = new Map();
+  if (directNode) {
+    const args = [...(server["args"] as string[])];
+    args[args.findIndex(isLegacyNodeMcpEntry)] =
+      "./mcp/codex_security_sdk_bridge.mjs";
+    server["args"] = args;
+    files.set("mcp/codex_security_sdk_bridge.mjs", {
+      contents: Buffer.from(
+        'import { runMain } from "node:module";\n' +
+          'import { dirname, join } from "node:path";\n' +
+          'import { fileURLToPath } from "node:url";\n' +
+          "const root = process.env.CODEX_SECURITY_PLUGIN_ROOT;\n" +
+          'process.argv[1] = root ? join(root, "mcp", "server.mjs") : join(dirname(fileURLToPath(import.meta.url)), "server.mjs");\n' +
+          "runMain(process.argv[1]);\n",
+      ),
+      mode: 0o644,
+    });
   } else {
-    paths = [];
-    const pending = [canonical];
-    let entries = 1;
-    while (pending.length > 0) {
-      throwIfSignalAborted(signal);
-      const path = pending.pop()!;
-      const metadata = await lstat(path);
-      if (metadata.isSymbolicLink()) {
-        throw new PluginBootstrapError(
-          `Plugin contains an unsafe source path: ${path}`,
-        );
-      }
-      if (metadata.isDirectory()) {
-        for await (const entry of pluginDirectoryEntries(path, signal)) {
-          const child = join(path, entry);
-          if (++entries > MAX_PLUGIN_COPY_ENTRIES) {
-            throw new PluginBootstrapError(
-              `Plugin source exceeds the copy entry limit: ${child}`,
-            );
-          }
-          pending.push(child);
-        }
-      } else if (metadata.isFile()) {
-        paths.push(relative(canonical, path).split(sep).join("/"));
-      } else {
-        throw new PluginBootstrapError(
-          `Plugin contains a non-regular file: ${path}`,
-        );
-      }
-    }
+    server["command"] =
+      server["command"] === "./scripts/launch_codex_security_mcp.cmd"
+        ? "./scripts/launch_codex_security_mcp_sdk.cmd"
+        : "./scripts/launch_codex_security_mcp_sdk";
+    files.set("scripts/launch_codex_security_mcp_sdk", {
+      contents: Buffer.from(
+        "#!/bin/sh\n" +
+          'if [ -n "${CODEX_SECURITY_PLUGIN_ROOT:-}" ]; then\n' +
+          '  exec "$CODEX_SECURITY_PLUGIN_ROOT/scripts/launch_codex_security_mcp" "$@"\n' +
+          "fi\n" +
+          'exec "$(dirname "$0")/launch_codex_security_mcp" "$@"\n',
+      ),
+      mode: 0o755,
+    });
+    files.set("scripts/launch_codex_security_mcp_sdk.cmd", {
+      contents: Buffer.from(
+        "@echo off\r\nsetlocal DisableDelayedExpansion\r\n" +
+          "if not defined CODEX_SECURITY_PLUGIN_ROOT goto codex_security_sdk_original\r\n" +
+          '"%CODEX_SECURITY_PLUGIN_ROOT%\\scripts\\launch_codex_security_mcp.cmd" %*\r\n' +
+          "exit /b\r\n:codex_security_sdk_original\r\n" +
+          '"%~dp0launch_codex_security_mcp.cmd" %*\r\n',
+      ),
+      mode: 0o755,
+    });
   }
-
-  paths.sort();
-  const fingerprint = createHash("sha256");
-  let totalSize = 0;
-  for (const relativePath of paths) {
-    throwIfSignalAborted(signal);
-    const path = join(canonical, ...relativePath.split("/"));
-    const metadata = await lstat(path);
-    if (!metadata.isFile() || metadata.isSymbolicLink()) {
-      throw new PluginBootstrapError(
-        `Plugin projection contains an unsafe source path: ${path}`,
-      );
-    }
-    if (metadata.size > MAX_PLUGIN_COPY_FILE_SIZE) {
-      throw new PluginBootstrapError(
-        `Plugin source exceeds the per-file safety limit: ${path}`,
-      );
-    }
-    totalSize += metadata.size;
-    if (totalSize > MAX_PLUGIN_COPY_SIZE) {
-      throw new PluginBootstrapError(
-        "Plugin source exceeds the copy safety limit.",
-      );
-    }
-    const handle = await open(
-      path,
-      constants.O_RDONLY |
-        (process.platform === "win32"
-          ? 0
-          : constants.O_NOFOLLOW | constants.O_NONBLOCK),
-    );
-    try {
-      if (!samePluginFile(metadata, await handle.stat())) {
-        throw new PluginBootstrapError(
-          `Plugin source changed before its integrity could be verified: ${path}`,
-        );
-      }
-      const contents = await readExactly(handle, metadata.size, 0, signal);
-      if (!samePluginFile(metadata, await handle.stat())) {
-        throw new PluginBootstrapError(
-          `Plugin source changed while its integrity was being verified: ${path}`,
-        );
-      }
-      fingerprint.update(relativePath);
-      fingerprint.update("\0");
-      fingerprint.update(String(metadata.size));
-      fingerprint.update("\0");
-      fingerprint.update(contents);
-      fingerprint.update("\0");
-    } finally {
-      await handle.close();
-    }
-  }
-  return fingerprint.digest("hex");
+  files.set(".mcp.json", {
+    contents: Buffer.from(`${JSON.stringify(configuration, null, 2)}\n`),
+  });
+  return { root, files };
 }
 
-async function codexSecurityPluginRegistration(
-  codexHome: string,
-): Promise<{ marketplace: boolean; plugin: boolean }> {
-  let config: unknown;
-  try {
-    config = parse(await readFile(join(codexHome, "config.toml"), "utf8"));
-  } catch (error) {
-    if (nodeErrorCode(error) === "ENOENT") {
-      return { marketplace: false, plugin: false };
-    }
-    throw new PluginBootstrapError(
-      "Unable to inspect the existing Codex Security plugin registration.",
-      { cause: error },
-    );
-  }
-  const marketplaces = isRecord(config) ? config["marketplaces"] : undefined;
-  const plugins = isRecord(config) ? config["plugins"] : undefined;
-  return {
-    marketplace:
-      isRecord(marketplaces) && isRecord(marketplaces[MARKETPLACE_NAME]),
-    plugin:
-      isRecord(plugins) &&
-      isRecord(plugins[`${PLUGIN_NAME}@${MARKETPLACE_NAME}`]),
-  };
+function isLegacyNodeMcpEntry(argument: unknown): boolean {
+  return argument === "./mcp/server.mjs" || argument === "mcp/server.mjs";
 }
 
-export function resolveCodexCommand(): CodexCommand {
-  const { packageName, targetTriple } = codexPlatformPackage();
+function isLegacyNodeMcpServer(server: Record<string, unknown>): boolean {
+  const command = server["command"];
+  return (
+    typeof command === "string" &&
+    ["node", "node.exe"].includes(basename(command).toLowerCase()) &&
+    Array.isArray(server["args"]) &&
+    server["args"].some(isLegacyNodeMcpEntry)
+  );
+}
+
+export function resolveCodexCommand(
+  environment: ProcessEnvironment = process.env,
+): CodexCommand {
+  const configured = environmentValue(environment, "CODEX_CLI_PATH");
+  const expanded =
+    configured === undefined ? undefined : expandHome(configured, environment);
+  if (
+    expanded &&
+    (process.platform !== "win32" || /\.(?:exe|com)$/iu.test(expanded))
+  ) {
+    return { command: resolve(expanded) };
+  }
+
+  const platform = process.platform === "android" ? "linux" : process.platform;
+  const packageName = `@openai/codex-${platform}-${process.arch}`;
   let packageJson: string;
   try {
     const require = createRequire(import.meta.url);
@@ -2321,45 +2822,32 @@ export function resolveCodexCommand(): CodexCommand {
       { cause: error },
     );
   }
+  const vendor = join(dirname(packageJson), "vendor");
+  const target = readdirSync(vendor, { withFileTypes: true }).find((entry) =>
+    entry.isDirectory(),
+  );
   const command = join(
-    dirname(packageJson),
-    "vendor",
-    targetTriple,
+    vendor,
+    target?.name ?? "",
     "bin",
     process.platform === "win32" ? "codex.exe" : "codex",
   );
-  if (!existsSync(command)) {
+  if (target === undefined || !existsSync(command)) {
     throw new PluginBootstrapError(
-      `The ${packageName} package does not contain the Codex executable for ${targetTriple}. Reinstall @openai/codex with optional dependencies enabled, or set CODEX_CLI_PATH to an installed Codex executable.`,
+      `The ${packageName} package does not contain the Codex executable. Reinstall @openai/codex with optional dependencies enabled, or set CODEX_CLI_PATH to an installed Codex executable.`,
     );
   }
-  return { command, prefixArgs: [] };
+  return { command };
 }
 
-export function codexPlatformPackage(
-  platform: NodeJS.Platform = process.platform,
-  architecture: string = process.arch,
-): { packageName: string; targetTriple: string } {
-  const key = `${platform}:${architecture}`;
-  const target: readonly [string, string] | undefined = {
-    "android:arm64": [
-      "@openai/codex-linux-arm64",
-      "aarch64-unknown-linux-musl",
-    ],
-    "android:x64": ["@openai/codex-linux-x64", "x86_64-unknown-linux-musl"],
-    "darwin:arm64": ["@openai/codex-darwin-arm64", "aarch64-apple-darwin"],
-    "darwin:x64": ["@openai/codex-darwin-x64", "x86_64-apple-darwin"],
-    "linux:arm64": ["@openai/codex-linux-arm64", "aarch64-unknown-linux-musl"],
-    "linux:x64": ["@openai/codex-linux-x64", "x86_64-unknown-linux-musl"],
-    "win32:arm64": ["@openai/codex-win32-arm64", "aarch64-pc-windows-msvc"],
-    "win32:x64": ["@openai/codex-win32-x64", "x86_64-pc-windows-msvc"],
-  }[key] as readonly [string, string] | undefined;
-  if (target === undefined) {
-    throw new PluginBootstrapError(
-      `Codex does not support this platform: ${platform} (${architecture}).`,
-    );
-  }
-  return { packageName: target[0], targetTriple: target[1] };
+export function executablePathForSpawn(command: string): string {
+  if (process.platform !== "win32" || !win32.isAbsolute(command))
+    return command;
+  // Root-relative paths still depend on the child's drive and working directory.
+  const root = win32.parse(command).root;
+  return root === "\\" || root === "/"
+    ? command
+    : win32.toNamespacedPath(command);
 }
 
 export async function bootstrapPlugin(
@@ -2379,125 +2867,258 @@ export async function bootstrapPlugin(
 ): Promise<PluginInstall> {
   const root = await realpath(pluginRoot);
   const { name, version } = await pluginMetadata(root);
-  const existingMarketplace = join(codexHome, "sdk-marketplace");
-  let upgradeExistingPlugin = false;
-  let repairIncompletePlugin = false;
-  let installedRoot: string | null = null;
-  try {
-    await verifyPluginRegistration(codexHome, existingMarketplace);
-    installedRoot = await findInstalledPlugin(codexHome);
-  } catch (error) {
-    throwIfSignalAborted(options.signal);
-    if (
-      !(error instanceof PluginBootstrapError) &&
-      nodeErrorCode(error) !== "ENOENT"
-    ) {
-      throw error;
-    }
-    const marketplace = await lstat(existingMarketplace).catch(
-      (failure: unknown) => {
-        if (nodeErrorCode(failure) === "ENOENT") return null;
-        throw failure;
-      },
-    );
-    if (
-      marketplace !== null &&
-      (!marketplace.isDirectory() || marketplace.isSymbolicLink())
-    ) {
-      throw new PluginBootstrapError(
-        `Codex Security marketplace is not a safe directory: ${existingMarketplace}`,
-      );
-    }
-    const registration = await codexSecurityPluginRegistration(codexHome);
-    repairIncompletePlugin =
-      marketplace !== null || registration.marketplace || registration.plugin;
-  }
-
-  if (installedRoot !== null) {
-    const installed = await pluginMetadata(installedRoot);
-    if (installed.name === name && installed.version === version) {
-      const [selectedFingerprint, marketplaceFingerprint] = await Promise.all([
-        pluginProjectionFingerprint(root, options.signal),
-        pluginProjectionFingerprint(
-          join(existingMarketplace, "plugins", PLUGIN_NAME),
-          options.signal,
-        ),
-      ]);
-      if (selectedFingerprint === marketplaceFingerprint) {
-        return {
-          pluginRoot: root,
-          marketplaceRoot: existingMarketplace,
-          installedRoot,
-          marketplaceName: MARKETPLACE_NAME,
-          name,
-          version,
-        };
-      }
-    }
-    upgradeExistingPlugin = true;
-  }
-
+  const projection = await legacyPluginProjection(root, options.signal);
+  const marketplace = join(codexHome, "sdk-marketplace");
   throwIfSignalAborted(options.signal);
-  const command = options.codexCommand ?? resolveCodexCommand();
+  const command =
+    options.codexCommand ?? resolveCodexCommand(options.environment);
   const environment = {
     ...(options.environment ?? process.env),
     CODEX_HOME: codexHome,
   };
-  const run = options.runCodex ?? runCodex;
-  if (upgradeExistingPlugin || repairIncompletePlugin) {
-    const registration = await codexSecurityPluginRegistration(codexHome);
-    if (registration.plugin) {
-      await run(
-        command,
-        ["plugin", "remove", `${PLUGIN_NAME}@${MARKETPLACE_NAME}`],
-        environment,
-        options.signal,
-      );
-      throwIfSignalAborted(options.signal);
-    }
-    if (registration.marketplace) {
-      await run(
-        command,
-        ["plugin", "marketplace", "remove", MARKETPLACE_NAME],
-        environment,
-        options.signal,
-      );
-      throwIfSignalAborted(options.signal);
-    }
-    throwIfSignalAborted(options.signal);
-    await rm(existingMarketplace, { recursive: true, force: true });
-    throwIfSignalAborted(options.signal);
-  }
-
-  const marketplace = await createMarketplace(codexHome, root, options.signal);
-  await run(
-    command,
-    ["plugin", "marketplace", "add", marketplace],
-    environment,
-    options.signal,
-  );
-  await run(
-    command,
-    ["plugin", "add", `${PLUGIN_NAME}@${MARKETPLACE_NAME}`],
-    environment,
-    options.signal,
-  );
-  await verifyPluginRegistration(codexHome, marketplace);
-  const verifiedInstalledRoot = await findInstalledPlugin(codexHome);
-  const installed = await pluginMetadata(verifiedInstalledRoot);
-  if (installed.name !== name || installed.version !== version) {
+  const run = options.runCodex ?? runPluginCommand;
+  const existing = await lstat(marketplace).catch(nullIfMissingFileError);
+  if (existing !== null && !existing.isDirectory()) {
     throw new PluginBootstrapError(
-      "Installed Codex Security plugin metadata does not match the selected plugin.",
+      `Codex Security plugin marketplace path must be a directory: ${marketplace}`,
     );
   }
+
+  const staged =
+    existing === null
+      ? null
+      : await pluginMetadata(join(marketplace, "plugins", PLUGIN_NAME)).catch(
+          () => null,
+        );
+  const stagedRoot = join(marketplace, "plugins", PLUGIN_NAME);
+  const stagedMatches =
+    staged?.version === version &&
+    (await pluginContentsMatch(
+      root,
+      stagedRoot,
+      options.signal,
+      false,
+      projection,
+    ));
+
+  if (!stagedMatches) {
+    if (existing !== null) {
+      await rm(marketplace, { recursive: true, force: true });
+    }
+    await createMarketplace(codexHome, root, options.signal);
+  } else if (
+    (await readFile(
+      join(marketplace, ".agents", "plugins", "marketplace.json"),
+      "utf8",
+    ).catch(nullIfMissingFileError)) !== MARKETPLACE_MANIFEST
+  ) {
+    await writeMarketplaceManifest(marketplace, options.signal);
+  }
+
+  const config = await readFile(join(codexHome, "config.toml"), "utf8").catch(
+    (error: unknown) => {
+      if (nodeErrorCode(error) === "ENOENT") return "";
+      throw error;
+    },
+  );
+  const configuration = parse(config);
+  const marketplaces = configuration["marketplaces"];
+  const registration = isRecord(marketplaces)
+    ? marketplaces[MARKETPLACE_NAME]
+    : undefined;
+
+  const registered =
+    isRecord(registration) &&
+    registration["source_type"] === "local" &&
+    typeof registration["source"] === "string" &&
+    (await sameFile(registration["source"], marketplace));
+
+  if (!registered) {
+    await run(
+      command,
+      ["plugin", "marketplace", "add", marketplace],
+      environment,
+      options.signal,
+    );
+  }
+
+  const installRecord = join(marketplace, "installed-plugin.json");
+  const previous: unknown = await readFile(installRecord, "utf8")
+    .then((value) => JSON.parse(value) as unknown)
+    .catch((error: unknown) => {
+      if (nodeErrorCode(error) === "ENOENT" || error instanceof SyntaxError) {
+        return null;
+      }
+      throw error;
+    });
+
+  const plugins = configuration["plugins"];
+  const plugin = isRecord(plugins)
+    ? plugins[`${PLUGIN_NAME}@${MARKETPLACE_NAME}`]
+    : undefined;
+
+  // Codex replaces the shared install even at the same version. Reuse it so
+  // workers from an earlier scan can keep using their plugin files.
+  if (
+    stagedMatches &&
+    registered &&
+    isRecord(plugin) &&
+    plugin["enabled"] === true &&
+    isRecord(previous) &&
+    typeof previous["installedPath"] === "string" &&
+    previous["version"] === version &&
+    (await pluginContentsMatch(
+      root,
+      previous["installedPath"],
+      options.signal,
+      true,
+      projection,
+    ))
+  ) {
+    return {
+      pluginRoot: root,
+      marketplaceRoot: marketplace,
+      installedRoot: previous["installedPath"],
+      marketplaceName: MARKETPLACE_NAME,
+      name,
+      version,
+    };
+  }
+
+  const output = await run(
+    command,
+    ["plugin", "add", "--json", `${PLUGIN_NAME}@${MARKETPLACE_NAME}`],
+    environment,
+    options.signal,
+  );
+
+  let installed: unknown;
+  try {
+    installed = JSON.parse(output);
+  } catch (error) {
+    throw new PluginBootstrapError(
+      "Codex plugin install did not return a valid JSON result.",
+      { cause: error },
+    );
+  }
+
+  if (
+    !isRecord(installed) ||
+    typeof installed["installedPath"] !== "string" ||
+    installed["version"] !== version
+  ) {
+    throw new PluginBootstrapError(
+      "Codex plugin install did not return the selected plugin path and version.",
+    );
+  }
+
+  await writeFile(
+    installRecord,
+    JSON.stringify({
+      installedPath: installed["installedPath"],
+      version,
+    }),
+    { mode: 0o600, signal: options.signal },
+  );
+
   return {
     pluginRoot: root,
     marketplaceRoot: marketplace,
-    installedRoot: verifiedInstalledRoot,
+    installedRoot: installed["installedPath"],
     marketplaceName: MARKETPLACE_NAME,
     name,
     version,
   };
+}
+
+async function pluginContentsMatch(
+  source: string,
+  destination: string,
+  signal?: AbortSignal,
+  allowExtraFiles = false,
+  projection?: LegacyPluginProjection,
+): Promise<boolean> {
+  throwIfSignalAborted(signal);
+
+  const sourceMetadata = await lstat(source);
+  const destinationMetadata = await lstat(destination).catch(
+    (error: unknown) => {
+      if (["ENOENT", "ENOTDIR"].includes(nodeErrorCode(error) ?? "")) {
+        return null;
+      }
+      throw error;
+    },
+  );
+
+  if (destinationMetadata === null) return false;
+
+  if (sourceMetadata.isFile() && destinationMetadata.isFile()) {
+    const projected = projection?.files.get(
+      relative(projection.root, source).split(sep).join("/"),
+    );
+    if (
+      (projected === undefined &&
+        sourceMetadata.size !== destinationMetadata.size) ||
+      ((projected?.mode === undefined || process.platform !== "win32") &&
+        ((projected?.mode ?? sourceMetadata.mode) & 0o111) !==
+          (destinationMetadata.mode & 0o111))
+    ) {
+      return false;
+    }
+    const [sourceBytes, destinationBytes] = await Promise.all([
+      readFile(source, { signal }),
+      readFile(destination, { signal }),
+    ]);
+    return (projected?.contents ?? sourceBytes).equals(destinationBytes);
+  }
+
+  if (!sourceMetadata.isDirectory() || !destinationMetadata.isDirectory()) {
+    return false;
+  }
+
+  const entries = await readdir(source);
+  const projectedDirectory =
+    projection === undefined
+      ? undefined
+      : relative(projection.root, source).split(sep).join("/") || ".";
+  const generated = [...(projection?.files ?? [])].filter(
+    ([path]) =>
+      dirname(path) === projectedDirectory && !entries.includes(basename(path)),
+  );
+  if (
+    !allowExtraFiles &&
+    entries.length + generated.length !== (await readdir(destination)).length
+  ) {
+    return false;
+  }
+  for (const [path, file] of generated) {
+    const generatedPath = join(destination, basename(path));
+    const metadata = await lstat(generatedPath).catch(nullIfMissingFileError);
+    if (
+      !metadata?.isFile() ||
+      (process.platform !== "win32" &&
+        (metadata.mode & 0o111) !== ((file.mode ?? 0o644) & 0o111)) ||
+      !file.contents.equals(await readFile(generatedPath, { signal }))
+    ) {
+      return false;
+    }
+  }
+
+  for (const entry of entries) {
+    if (
+      !(await pluginContentsMatch(
+        join(source, entry),
+        join(destination, entry),
+        signal,
+        allowExtraFiles,
+        projection,
+      ))
+    ) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 export async function pluginMetadata(
@@ -2506,36 +3127,10 @@ export async function pluginMetadata(
   const manifestPath = join(root, ".codex-plugin", "plugin.json");
   let manifest: unknown;
   try {
-    const expected = await lstat(manifestPath);
-    if (
-      !expected.isFile() ||
-      expected.isSymbolicLink() ||
-      expected.size > MAX_PLUGIN_MANIFEST_SIZE
-    ) {
-      throw new Error("plugin manifest is not a bounded regular file");
+    if (!(await lstat(manifestPath)).isFile()) {
+      throw new Error("plugin manifest is not a regular file");
     }
-    const input = await open(
-      manifestPath,
-      constants.O_RDONLY |
-        (process.platform === "win32"
-          ? 0
-          : constants.O_NOFOLLOW | constants.O_NONBLOCK),
-    );
-    try {
-      const opened = await input.stat();
-      if (!samePluginFile(expected, opened)) {
-        throw new Error("plugin manifest changed before reading");
-      }
-      const bytes = await readExactly(input, expected.size, 0);
-      if (!samePluginFile(expected, await input.stat())) {
-        throw new Error("plugin manifest changed while reading");
-      }
-      manifest = JSON.parse(
-        new TextDecoder("utf-8", { fatal: true }).decode(bytes),
-      );
-    } finally {
-      await input.close();
-    }
+    manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   } catch (error) {
     throw new PluginBootstrapError(`Invalid Codex plugin directory: ${root}`, {
       cause: error,
@@ -2559,30 +3154,49 @@ export async function resolvePluginPython(
   options: PluginPythonOptions = {},
 ): Promise<string> {
   const environment = options.environment ?? process.env;
-  const protectedRoot = options.protectedRoot ?? process.cwd();
+  const requestedRoots = options.protectedRoot ?? process.cwd();
+  const protectedRoot =
+    typeof requestedRoots === "string" ? [requestedRoots] : [...requestedRoots];
+  const callerDirectories = [
+    process.cwd(),
+    options.currentDirectory ?? process.cwd(),
+  ];
+  // Preserve target and enclosing-checkout protection for every interpreter.
+  for (const directory of new Set([...callerDirectories, ...protectedRoot])) {
+    for (const checkout of await gitProtectionRoots(directory, options.signal))
+      if (!protectedRoot.includes(checkout)) protectedRoot.push(checkout);
+  }
+  // Named interpreters are ambient PATH discovery, even when PYTHON names one.
+  // Explicit trusted paths and managed runtimes retain their existing precedence.
+  const discoveryRoots = [...protectedRoot, ...callerDirectories];
   if (options.configuredPath !== undefined) {
     return await requirePython(
       options.configuredPath,
       "configured plugin Python",
       environment,
-      protectedRoot,
+      isPythonPathCandidate(options.configuredPath)
+        ? protectedRoot
+        : discoveryRoots,
       options.signal,
     );
   }
-  const inherited = environment["PYTHON"]?.trim();
+  const inherited = environmentValue(environment, "PYTHON");
   if (inherited) {
     return await requirePython(
       inherited,
       "PYTHON",
       environment,
-      protectedRoot,
+      isPythonPathCandidate(inherited) ? protectedRoot : discoveryRoots,
       options.signal,
     );
   }
 
   const home = options.homeDirectory ?? homedir();
+  const cacheDirectory =
+    environmentValue(environment, "XDG_CACHE_HOME", true) ||
+    join(home, ".cache");
   const managedRoots = options.managedRuntimeRoots ?? [
-    join(home, ".cache", "codex-runtimes", "codex-primary-runtime"),
+    join(cacheDirectory, "codex-runtimes", "codex-primary-runtime"),
   ];
   const relativeCandidates =
     process.platform === "win32"
@@ -2609,19 +3223,19 @@ export async function resolvePluginPython(
   }
 
   for (const candidate of process.platform === "win32"
-    ? ["python", "python3"]
+    ? ["python", "python3", "py"]
     : ["python3", "python"]) {
     const resolved = await usablePython(
       candidate,
       environment,
-      protectedRoot,
+      discoveryRoots,
       options.signal,
     );
     if (resolved !== null) return resolved;
   }
   throw new PluginPythonUnavailableError(
     "The bundled Codex Security plugin requires Python 3.10 or later (Python 3.10 also requires tomli), but no usable interpreter was found. " +
-      "Set pythonPath, --python, or PYTHON, install the Codex managed runtime, or add python3/python to PATH.",
+      "Set pythonPath, --python, or PYTHON, install the Codex managed runtime, or add python3/python (py on Windows) to PATH.",
   );
 }
 
@@ -2630,33 +3244,183 @@ export function pluginExecutionEnvironment(
   environment: ProcessEnvironment = process.env,
 ): ProcessEnvironment {
   return {
-    ...environment,
+    ...pythonUtf8Environment(environment),
     PYTHON: python,
-    CODEX_CLI_PATH:
-      environment["CODEX_CLI_PATH"]?.trim() || resolveCodexCommand().command,
+    CODEX_CLI_PATH: resolveCodexCommand(environment).command,
   };
+}
+
+export function environmentWithGit(
+  environment: ProcessEnvironment,
+  git?: InspectedExecutable,
+): ProcessEnvironment {
+  if (git === undefined) return environment;
+  const result = { ...environment };
+  for (const name of Object.keys(result)) {
+    const normalized = name.toUpperCase();
+    if (normalized === "CODEX_SECURITY_GIT" || normalized === "PATH") {
+      delete result[name];
+    }
+  }
+  result["CODEX_SECURITY_GIT"] = git.executable ?? "";
+  result["PATH"] = git.environment["PATH"] ?? "";
+  return result;
+}
+
+export function pythonUtf8Environment(
+  environment: ProcessEnvironment,
+): ProcessEnvironment {
+  const normalized = { ...environment };
+  for (const name of Object.keys(normalized)) {
+    if (name.toUpperCase() === "PYTHONUTF8") delete normalized[name];
+  }
+  normalized["PYTHONUTF8"] = "1";
+  return normalized;
+}
+
+function pluginHelperEnvironment(
+  environment: ProcessEnvironment,
+): ProcessEnvironment {
+  return pythonUtf8Environment(
+    Object.fromEntries(
+      Object.entries(environment).filter(
+        ([name]) =>
+          !PLUGIN_HELPER_SECRET_ENVIRONMENT_VARIABLES.has(name.toUpperCase()),
+      ),
+    ),
+  );
 }
 
 export async function cleanupSdkDirectory(path: string): Promise<void> {
   await rm(path, { recursive: true, force: true });
 }
 
-async function runCodex(
+export async function runCodexCommand(
+  command: CodexCommand,
+  args: readonly string[],
+  environment: ProcessEnvironment,
+  input?: string | Uint8Array,
+  signal?: AbortSignal,
+  archiveHandshake = false,
+): Promise<CodexCommandResult> {
+  const cancellation = archiveHandshake ? new AbortController() : undefined;
+  const abort = () => cancellation?.abort(signal?.reason);
+  let awaitingArchive = archiveHandshake;
+  const child = spawn(
+    executablePathForSpawn(command.command),
+    [...(command.args ?? []), ...args],
+    {
+      env: environment,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      signal: cancellation?.signal ?? signal,
+    },
+  );
+  let stdout = "";
+  let stderr = "";
+  let processError: Error | undefined;
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+    if (awaitingArchive && stdout.startsWith(ARCHIVE_READY)) {
+      awaitingArchive = false;
+      stdout = stdout.slice(ARCHIVE_READY.length);
+      signal?.removeEventListener("abort", abort);
+      // The helper cannot rename until this acknowledgement. Detach and check
+      // cancellation before allowing the filesystem/database transaction.
+      if (signal?.aborted) abort();
+      else child.stdin.end("\n");
+    }
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  const completion = new Promise<CodexCommandResult>((resolve, reject) => {
+    child.once("error", (error) => {
+      processError = error;
+    });
+    child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+      if (
+        !["EPIPE", "ECONNRESET", "EOF", "ERR_STREAM_DESTROYED"].includes(
+          error.code ?? "",
+        )
+      )
+        processError = error;
+    });
+    child.once("close", (exitCode) =>
+      processError === undefined
+        ? resolve({ success: exitCode === 0, exitCode, stdout, stderr })
+        : reject(processError),
+    );
+  });
+  if (archiveHandshake) {
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+  }
+  try {
+    if (archiveHandshake) child.stdin.write(`${JSON.stringify(input ?? "")}\n`);
+    else child.stdin.end(input);
+    return await completion;
+  } finally {
+    if (archiveHandshake) signal?.removeEventListener("abort", abort);
+  }
+}
+
+export async function probeCodexSandbox(
+  command: CodexCommand,
+  environment: ProcessEnvironment,
+  signal?: AbortSignal,
+): Promise<void> {
+  // This preflight covers the Unix sandbox backends.
+  if (process.platform === "win32") return;
+  // Reuse the resolved Codex executable instead of looking up a probe on PATH.
+  const args = ["sandbox", "--", command.command, "--version"];
+  const timeout = AbortSignal.timeout(SANDBOX_PROBE_TIMEOUT_MILLISECONDS);
+  let detail: string;
+  try {
+    const result = await runCodexCommand(
+      command,
+      args,
+      environment,
+      undefined,
+      signal === undefined ? timeout : AbortSignal.any([signal, timeout]),
+    );
+    if (result.success) return;
+    detail =
+      result.stderr.trim() ||
+      result.stdout.trim() ||
+      `Codex exited with status ${result.exitCode}.`;
+  } catch (error) {
+    signal?.throwIfAborted();
+    detail = processErrorDetail(error);
+  }
+  throw new SandboxUnavailableError(
+    `Codex could not run a command in its sandbox; reproduce with '${command.command} ${args.join(" ")}'. On Linux this usually means unprivileged user namespaces are restricted (kernel.apparmor_restrict_unprivileged_userns=1 on Ubuntu 24.04 and later), which Bubblewrap needs; inside the container image, use the AppArmor profile and Compose override from the SDK README. Codex reported: ${detail}`,
+  );
+}
+
+async function runPluginCommand(
   command: CodexCommand,
   args: readonly string[],
   environment: ProcessEnvironment,
   signal?: AbortSignal,
 ): Promise<string> {
   try {
-    const { stdout } = await execFile(
-      command.command,
-      [...command.prefixArgs, ...args],
-      {
-        env: environment,
-        encoding: "utf8",
-        signal,
-      },
+    const { success, exitCode, stdout, stderr } = await runCodexCommand(
+      command,
+      args,
+      environment,
+      undefined,
+      signal,
     );
+    if (!success) {
+      throw new Error(
+        stderr.trim() ||
+          stdout.trim() ||
+          `Codex exited with status ${exitCode}.`,
+      );
+    }
     return stdout;
   } catch (error) {
     const detail = processErrorDetail(error);
@@ -2664,31 +3428,6 @@ async function runCodex(
       cause: error,
     });
   }
-}
-
-async function findInstalledPlugin(codexHome: string): Promise<string> {
-  const root = join(
-    codexHome,
-    "plugins",
-    "cache",
-    MARKETPLACE_NAME,
-    PLUGIN_NAME,
-  );
-  const candidates: string[] = [];
-  for (const entry of await readdir(root, { withFileTypes: true }).catch(
-    () => [],
-  )) {
-    if (entry.isDirectory()) {
-      const candidate = join(root, entry.name);
-      if (await hasPluginManifest(candidate)) candidates.push(candidate);
-    }
-  }
-  if (candidates.length !== 1) {
-    throw new PluginBootstrapError(
-      "Codex plugin install did not produce one installed Codex Security plugin.",
-    );
-  }
-  return await realpath(candidates[0]!);
 }
 
 async function discoverPluginRoot(root: string): Promise<string> {
@@ -2711,233 +3450,35 @@ async function validatePluginRoot(root: string): Promise<string> {
   return await realpath(root);
 }
 
-async function verifyPluginRegistration(
-  codexHome: string,
-  marketplace: string,
-): Promise<void> {
-  const configPath = join(codexHome, "config.toml");
-  let config: unknown;
-  try {
-    config = parse(await readFile(configPath, "utf8"));
-  } catch (error) {
-    throw new PluginBootstrapError(
-      "Codex plugin bootstrap produced an unreadable config.toml.",
-      {
-        cause: error,
-      },
-    );
-  }
-  const marketplaces = isRecord(config) ? config["marketplaces"] : undefined;
-  const plugins = isRecord(config) ? config["plugins"] : undefined;
-  const marketplaceConfig = isRecord(marketplaces)
-    ? marketplaces[MARKETPLACE_NAME]
-    : undefined;
-  const pluginConfig = isRecord(plugins)
-    ? plugins[`${PLUGIN_NAME}@${MARKETPLACE_NAME}`]
-    : undefined;
-  if (!isRecord(marketplaceConfig) || !isRecord(pluginConfig)) {
-    throw new PluginBootstrapError(
-      "Codex plugin bootstrap did not preserve plugin registration.",
-    );
-  }
-  const registeredSource = String(marketplaceConfig["source"] ?? "");
-  if (!(await sameFile(registeredSource, marketplace))) {
-    throw new PluginBootstrapError(
-      "Codex plugin marketplace registration has the wrong source.",
-    );
-  }
-  if (pluginConfig["enabled"] !== true) {
-    throw new PluginBootstrapError(
-      "Codex Security plugin is not enabled after bootstrap.",
-    );
-  }
-}
-
 async function copyPluginTree(
   source: string,
   destination: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const pending: Array<{ source: string; destination: string }> = [
-    { source, destination },
-  ];
-  const directories = new Map<string, Stats>();
-  let entries = 1;
-  let size = 0;
   await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
   try {
-    while (pending.length > 0) {
-      throwIfSignalAborted(signal);
-      const current = pending.pop()!;
-      await requirePluginAncestors(source, current.source, directories, signal);
-      const metadata = await lstat(current.source);
-      if (metadata.isSymbolicLink()) {
-        throw new PluginBootstrapError(
-          `Plugin contains an unsafe source path: ${current.source}`,
-        );
-      }
-      if (metadata.isDirectory()) {
-        for await (const entry of pluginDirectoryEntries(
-          current.source,
-          signal,
-        )) {
-          const childSource = join(current.source, entry);
-          if (++entries > MAX_PLUGIN_COPY_ENTRIES) {
-            throw new PluginBootstrapError(
-              `Plugin source exceeds the copy entry limit: ${childSource}`,
-            );
-          }
-          pending.push({
-            source: childSource,
-            destination: join(current.destination, entry),
-          });
-        }
-        const afterRead = await lstat(current.source);
-        if (!samePluginFile(metadata, afterRead)) {
+    await cp(source, destination, {
+      recursive: true,
+      force: false,
+      filter: async (path) => {
+        throwIfSignalAborted(signal);
+        const metadata = await lstat(path);
+        if (
+          (!metadata.isDirectory() && !metadata.isFile()) ||
+          (await realpath(path)) !== path
+        ) {
           throw new PluginBootstrapError(
-            `Plugin directory changed while it was being copied: ${current.source}`,
+            `Plugin contains an unsafe source path: ${path}`,
           );
         }
-        directories.set(current.source, afterRead);
-        await mkdir(current.destination, { mode: 0o700 });
-        continue;
-      }
-      if (!metadata.isFile()) {
-        throw new PluginBootstrapError(
-          `Plugin contains a non-regular file: ${current.source}`,
-        );
-      }
-      if (metadata.size > MAX_PLUGIN_COPY_FILE_SIZE) {
-        throw new PluginBootstrapError(
-          `Plugin source exceeds the per-file safety limit: ${current.source}`,
-        );
-      }
-      size += metadata.size;
-      if (size > MAX_PLUGIN_COPY_SIZE) {
-        throw new PluginBootstrapError(
-          "Plugin source exceeds the copy safety limit.",
-        );
-      }
-      const input = await open(
-        current.source,
-        constants.O_RDONLY |
-          (process.platform === "win32"
-            ? 0
-            : constants.O_NOFOLLOW | constants.O_NONBLOCK),
-      );
-      let output: Awaited<ReturnType<typeof open>> | undefined;
-      try {
-        if (!samePluginFile(metadata, await input.stat())) {
-          throw new PluginBootstrapError(
-            `Plugin source changed before it could be copied: ${current.source}`,
-          );
-        }
-        await requirePluginAncestors(
-          source,
-          current.source,
-          directories,
-          signal,
-        );
-        const bytes = await readExactly(input, metadata.size, 0, signal);
-        if (!samePluginFile(metadata, await input.stat())) {
-          throw new PluginBootstrapError(
-            `Plugin source changed while it was being copied: ${current.source}`,
-          );
-        }
-        await requirePluginAncestors(
-          source,
-          current.source,
-          directories,
-          signal,
-        );
-        output = await open(
-          current.destination,
-          constants.O_WRONLY |
-            constants.O_CREAT |
-            constants.O_EXCL |
-            (process.platform === "win32" ? 0 : constants.O_NOFOLLOW),
-          0o600,
-        );
-        await output.writeFile(bytes);
-        await output.chmod(metadata.mode & 0o777);
-      } finally {
-        await output?.close();
-        await input.close();
-      }
-    }
+        throwIfSignalAborted(signal);
+        return true;
+      },
+    });
   } catch (error) {
     await rm(destination, { recursive: true, force: true });
     throw error;
   }
-}
-
-async function* pluginDirectoryEntries(
-  path: string,
-  signal?: AbortSignal,
-): AsyncGenerator<string> {
-  throwIfSignalAborted(signal);
-  const directory = await opendir(path);
-  try {
-    for (;;) {
-      throwIfSignalAborted(signal);
-      const entry = await directory.read();
-      throwIfSignalAborted(signal);
-      if (entry === null) return;
-      yield entry.name;
-    }
-  } finally {
-    await directory.close();
-  }
-}
-
-async function requirePluginAncestors(
-  root: string,
-  path: string,
-  directories: ReadonlyMap<string, Stats>,
-  signal?: AbortSignal,
-): Promise<void> {
-  const relativePath = relative(root, path);
-  if (
-    relativePath === ".." ||
-    relativePath.startsWith(`..${sep}`) ||
-    isAbsolute(relativePath)
-  ) {
-    throw new PluginBootstrapError(
-      `Plugin source path escapes its root: ${path}`,
-    );
-  }
-  if (relativePath === "") return;
-
-  let ancestor = root;
-  const parents = ["", ...relativePath.split(sep).slice(0, -1)];
-  for (const component of parents) {
-    throwIfSignalAborted(signal);
-    if (component !== "") ancestor = join(ancestor, component);
-    const expected = directories.get(ancestor);
-    const actual = await lstat(ancestor);
-    if (
-      expected === undefined ||
-      actual.isSymbolicLink() ||
-      !actual.isDirectory() ||
-      !samePluginFile(expected, actual)
-    ) {
-      throw new PluginBootstrapError(
-        `Plugin source directory changed while it was being copied: ${ancestor}`,
-      );
-    }
-  }
-}
-
-function samePluginFile(first: Stats, second: Stats): boolean {
-  return (
-    first.dev === second.dev &&
-    first.ino === second.ino &&
-    first.size === second.size &&
-    first.mtimeMs === second.mtimeMs &&
-    first.mode === second.mode &&
-    first.isFile() === second.isFile() &&
-    first.isDirectory() === second.isDirectory()
-  );
 }
 
 async function readExactly(
@@ -2962,56 +3503,6 @@ async function readExactly(
   return buffer;
 }
 
-async function copyExternalPayload(
-  source: string,
-  destination: string,
-): Promise<void> {
-  const contractPath = join(
-    source,
-    ".internal",
-    "external-promotion",
-    "external-projection-contract.json",
-  );
-  let contract: unknown;
-  try {
-    contract = JSON.parse(await readFile(contractPath, "utf8"));
-  } catch (error) {
-    throw new PluginBootstrapError(
-      `Invalid plugin projection contract: ${contractPath}`,
-      {
-        cause: error,
-      },
-    );
-  }
-  const shippedExact = isRecord(contract)
-    ? contract["shippedExact"]
-    : undefined;
-  if (
-    !Array.isArray(shippedExact) ||
-    !shippedExact.every((value) => typeof value === "string")
-  ) {
-    throw new PluginBootstrapError(
-      "Plugin projection contract must contain shippedExact paths.",
-    );
-  }
-  const paths = [".codex-plugin/plugin.json", ...shippedExact].filter(
-    (value) => !value.startsWith("sdk/"),
-  );
-  for (const path of paths) {
-    const normalized = safeArchivePath(path);
-    const sourcePath = join(source, ...normalized.split("/"));
-    const destinationPath = join(destination, ...normalized.split("/"));
-    const metadata = await lstat(sourcePath).catch(() => null);
-    if (metadata === null || !metadata.isFile() || metadata.isSymbolicLink()) {
-      throw new PluginBootstrapError(
-        `Bundled plugin file is missing or unsafe: ${sourcePath}`,
-      );
-    }
-    await mkdir(dirname(destinationPath), { recursive: true, mode: 0o700 });
-    await copyFile(sourcePath, destinationPath, constants.COPYFILE_EXCL);
-  }
-}
-
 function safeArchivePath(value: string): string {
   const parts = value.split("/");
   const normalized = parts
@@ -3025,7 +3516,7 @@ function safeArchivePath(value: string): string {
     parts.includes("..") ||
     value.includes("\\") ||
     value.includes("\0") ||
-    parts.some((part) => part.includes(":")) ||
+    parts.some(isWindowsUnsafePathComponent) ||
     normalized.length === 0
   ) {
     throw new PluginBootstrapError(
@@ -3039,7 +3530,7 @@ async function requirePython(
   candidate: string,
   source: string,
   environment: ProcessEnvironment,
-  protectedRoot: string,
+  protectedRoot: string | readonly string[],
   signal?: AbortSignal,
 ): Promise<string> {
   const resolved = await usablePython(
@@ -3058,11 +3549,13 @@ async function requirePython(
 async function usablePython(
   candidate: string,
   environment: ProcessEnvironment = process.env,
-  protectedRoot: string = process.cwd(),
+  protectedRoot: string | readonly string[] = process.cwd(),
   signal?: AbortSignal,
 ): Promise<string | null> {
   const command = await resolveTrustedExecutable(
-    isPythonPathCandidate(candidate) ? expandHome(candidate) : candidate,
+    isPythonPathCandidate(candidate)
+      ? expandHome(candidate, environment)
+      : candidate,
     environment,
     protectedRoot,
   );
@@ -3093,45 +3586,44 @@ async function usablePython(
 }
 
 export function isPythonPathCandidate(candidate: string): boolean {
-  return (
-    candidate.includes("/") ||
-    candidate.includes("\\") ||
-    candidate.startsWith(".")
-  );
+  return candidate.includes("/") || candidate.includes("\\");
 }
 
 async function hasPluginManifest(root: string): Promise<boolean> {
-  return await isRegularFile(join(root, ".codex-plugin", "plugin.json"));
+  return await lstat(join(root, ".codex-plugin", "plugin.json")).then(
+    (metadata) => metadata.isFile(),
+    () => false,
+  );
 }
 
-async function isRegularFile(path: string): Promise<boolean> {
-  try {
-    const metadata = await lstat(path);
-    return metadata.isFile() && !metadata.isSymbolicLink();
-  } catch {
-    return false;
-  }
-}
-
-async function sameFile(left: string, right: string): Promise<boolean> {
-  try {
-    const [leftMetadata, rightMetadata] = await Promise.all([
-      stat(left),
-      stat(right),
-    ]);
-    return (
+/** @internal Compare filesystem identity without depending on path spelling. */
+export function sameFile(left: string, right: string): Promise<boolean> {
+  // NTFS file IDs can exceed JavaScript's safe integer range.
+  return Promise.all([
+    stat(left, { bigint: true }),
+    stat(right, { bigint: true }),
+  ]).then(
+    ([leftMetadata, rightMetadata]) =>
       leftMetadata.dev === rightMetadata.dev &&
-      leftMetadata.ino === rightMetadata.ino
-    );
-  } catch {
-    return false;
-  }
+      leftMetadata.ino === rightMetadata.ino,
+    () => false,
+  );
 }
 
-export function expandHome(value: string): string {
-  if (value === "~") return homedir();
-  if (value.startsWith("~/") || value.startsWith("~\\")) {
-    return join(homedir(), value.slice(2));
+export function expandHome(
+  value: string,
+  environment: ProcessEnvironment = process.env,
+): string {
+  const home =
+    (process.platform === "win32"
+      ? (environmentValue(environment, "USERPROFILE") ??
+        environmentValue(environment, "HOME"))
+      : (environmentValue(environment, "HOME") ??
+        environmentValue(environment, "USERPROFILE"))) ?? homedir();
+  if (value === "~") return home;
+  if (value.startsWith("~/")) return join(home, value.slice(2));
+  if (value.startsWith("~\\")) {
+    return join(home, ...value.slice(2).split("\\"));
   }
   return value;
 }
@@ -3154,23 +3646,29 @@ function processErrorDetail(error: unknown): string {
   return String(error) || "unknown error";
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function nodeErrorCode(error: unknown): string | undefined {
   return isRecord(error) && typeof error["code"] === "string"
     ? error["code"]
     : undefined;
 }
 
-function abortReason(signal: AbortSignal): unknown {
-  return (
-    signal.reason ??
-    new DOMException("The operation was aborted.", "AbortError")
-  );
-}
-
 function throwIfSignalAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw abortReason(signal);
 }
+
+function nullIfMissingFileError(error: unknown): null {
+  if (nodeErrorCode(error) === "ENOENT") return null;
+  throw error;
+}
+
+/** @internal */
+export function workbenchEnvironment(environment: ProcessEnvironment) {
+  return {
+    ...environment,
+    CODEX_SECURITY_STATE_DIR: codexSecurityStateDirectory(environment),
+  };
+}
+
+/** @internal */
+export const resolveWorkbenchRuntime = (options: PluginPythonOptions) =>
+  Promise.all([resolvePluginPython(options), bundledPluginRoot()]);
