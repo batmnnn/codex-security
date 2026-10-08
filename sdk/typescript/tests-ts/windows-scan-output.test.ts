@@ -225,35 +225,31 @@ windowsTest.each(
   },
 );
 
-windowsTest(
-  "existing Windows scan ACLs and native sandbox grants are preserved",
-  async () => {
-    const root = await temporaryDirectory();
-    const output = join(root, "scan");
-    await mkdir(output);
-    // Synthetic capability-format SID: verify preservation, not native sandbox identity.
-    const capability = "S-1-5-21-444-555-666-777";
-    await icacls(output, "/grant", `*${capability}:(OI)(CI)M`);
-    const before = await descriptor(output);
-    expect(before).toContain(capability);
-    expect(await runtime.prepareOutputDir(output, "fixture")).toBe(
-      await realpath(output),
-    );
-    expect(await descriptor(output)).toBe(before);
-    await cp(example, output, { recursive: true });
-    expect(
-      await runtime.prepareScanRegistrationOutput(
-        output,
-        "fixture",
-        root,
-        undefined,
-        true,
-      ),
-    ).toBe(await realpath(output));
-    await loadContract(output, { pluginRoot: PLUGIN_ROOT });
-    expect(await descriptor(output)).toBe(before);
-  },
-);
+windowsTest("existing Windows scan ACLs are preserved", async () => {
+  const root = await temporaryDirectory();
+  const output = join(root, "scan");
+  await mkdir(output);
+  // Built-in Users exists on every Windows host; only this fixture gets the grant.
+  await icacls(output, "/grant", "*S-1-5-32-545:(OI)(CI)M");
+  const before = await descriptor(output);
+  expect(before).toContain(";;;BU)");
+  expect(await runtime.prepareOutputDir(output, "fixture")).toBe(
+    await realpath(output),
+  );
+  expect(await descriptor(output)).toBe(before);
+  await cp(example, output, { recursive: true });
+  expect(
+    await runtime.prepareScanRegistrationOutput(
+      output,
+      "fixture",
+      root,
+      undefined,
+      true,
+    ),
+  ).toBe(await realpath(output));
+  await loadContract(output, { pluginRoot: PLUGIN_ROOT });
+  expect(await descriptor(output)).toBe(before);
+});
 
 windowsTest(
   "archiving Windows output preserves old ACLs and privately creates the replacement",
